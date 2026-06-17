@@ -2,7 +2,7 @@
 """PyDaemonControl: a small directory-scoped process controller.
 
 One daemon owns one root directory. Clients are one-shot commands that talk to
-the daemon over a Unix domain socket.
+the daemon over a local IPC endpoint.
 """
 
 from __future__ import annotations
@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import signal
 import socket
+import secrets
 import subprocess
 import sys
 import threading
@@ -26,10 +28,19 @@ try:
 except ImportError:  # pragma: no cover - this tool is intended for Linux hosts.
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - only available on Windows.
+    msvcrt = None
+
 
 DEFAULT_MAX_LOG_BYTES = 32 * 1024 * 1024
 DEFAULT_ROTATE_COUNT = 3
 DEFAULT_TAIL_CHARS = 256 * 1024
+REQUEST_LIMIT_BYTES = 8 * 1024 * 1024
+STDIN_QUEUE_LIMIT = 128
+STDIN_WRITE_ACK_TIMEOUT = 0.25
+IS_WINDOWS = os.name == "nt"
 
 
 class RpcError(Exception):
@@ -55,6 +66,7 @@ def state_paths(root: Path) -> dict[str, Path]:
         "state": state,
         "logs": state / "logs",
         "socket": state / "daemon.sock",
+        "endpoint": state / "daemon.endpoint.json",
         "pid": state / "daemon.pid",
         "lock": state / "daemon.lock",
         "daemon_log": state / "daemon.log",
@@ -81,12 +93,264 @@ def write_daemon_log(paths: dict[str, Path], message: str) -> None:
         fh.write(line)
 
 
+class DaemonLock:
+    def acquire(self) -> None:
+        raise NotImplementedError
+
+    def release(self) -> None:
+        raise NotImplementedError
+
+
+class PosixDaemonLock(DaemonLock):
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = lock_path
+        self._fh: Any = None
+
+    def acquire(self) -> None:
+        if fcntl is None:
+            raise RpcError("fcntl is required for POSIX daemon locking")
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.lock_path.open("w")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RpcError(f"daemon lock is already held: {self.lock_path}") from exc
+
+    def release(self) -> None:
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._fh.close()
+                self._fh = None
+
+
+class WindowsDaemonLock(DaemonLock):
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = lock_path
+        self._fh: Any = None
+
+    def acquire(self) -> None:
+        if msvcrt is None:
+            raise RpcError("msvcrt is required for Windows daemon locking")
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.lock_path.open("a+b")
+        self._fh.seek(0)
+        if not self._fh.read(1):
+            self._fh.seek(0)
+            self._fh.write(b"\0")
+            self._fh.flush()
+        self._fh.seek(0)
+        try:
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise RpcError(f"daemon lock is already held: {self.lock_path}") from exc
+
+    def release(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                self._fh.close()
+                self._fh = None
+
+
+class IpcEndpoint:
+    def bind_server(self) -> socket.socket:
+        raise NotImplementedError
+
+    def connect_client(self, timeout: float) -> socket.socket:
+        raise NotImplementedError
+
+    def prepare_client_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return payload
+
+    def validate_server_request(self, payload: dict[str, Any]) -> None:
+        return None
+
+    def cleanup(self) -> None:
+        return None
+
+
+class UnixSocketEndpoint(IpcEndpoint):
+    def __init__(self, socket_path: Path) -> None:
+        self.socket_path = socket_path
+
+    def bind_server(self) -> socket.socket:
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o600)
+        return server
+
+    def connect_client(self, timeout: float) -> socket.socket:
+        if not self.socket_path.exists():
+            raise RpcError(f"daemon socket does not exist: {self.socket_path}")
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(str(self.socket_path))
+        return client
+
+    def cleanup(self) -> None:
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+
+
+class TcpEndpoint(IpcEndpoint):
+    def __init__(self, endpoint_path: Path) -> None:
+        self.endpoint_path = endpoint_path
+        self.host = "127.0.0.1"
+        self.port: int | None = None
+        self.token: str | None = None
+
+    def bind_server(self) -> socket.socket:
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind((self.host, 0))
+        self.port = int(server.getsockname()[1])
+        self.token = secrets.token_hex(32)
+        payload = {
+            "transport": "tcp",
+            "host": self.host,
+            "port": self.port,
+            "token": self.token,
+            "pid": os.getpid(),
+        }
+        tmp_path = self.endpoint_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(self.endpoint_path)
+        return server
+
+    def connect_client(self, timeout: float) -> socket.socket:
+        if not self.endpoint_path.exists():
+            raise RpcError(f"daemon endpoint does not exist: {self.endpoint_path}")
+        try:
+            data = json.loads(self.endpoint_path.read_text(encoding="utf-8"))
+            if data.get("transport") != "tcp":
+                raise ValueError("unsupported endpoint transport")
+            self.host = str(data["host"])
+            self.port = int(data["port"])
+            self.token = str(data["token"])
+        except Exception as exc:
+            raise RpcError(f"invalid daemon endpoint file: {exc}") from exc
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect((self.host, self.port))
+        return client
+
+    def prepare_client_request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.token:
+            raise RpcError("missing daemon endpoint token")
+        with_token = dict(payload)
+        with_token["_token"] = self.token
+        return with_token
+
+    def validate_server_request(self, payload: dict[str, Any]) -> None:
+        if payload.pop("_token", None) != self.token:
+            raise RpcError("invalid client token")
+
+    def cleanup(self) -> None:
+        if self.endpoint_path.exists():
+            self.endpoint_path.unlink()
+
+
+class ProcessSupervisor:
+    def popen_kwargs(self, detached: bool = False) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def stop_process(self, proc: subprocess.Popen[bytes], write_event: Any, grace: float) -> None:
+        raise NotImplementedError
+
+
+class PosixProcessSupervisor(ProcessSupervisor):
+    def popen_kwargs(self, detached: bool = False) -> dict[str, Any]:
+        return {"start_new_session": True}
+
+    def stop_process(self, proc: subprocess.Popen[bytes], write_event: Any, grace: float) -> None:
+        pid = proc.pid
+        write_event("system", f"stopping process group {pid}")
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.time() + max(0.0, grace)
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.05)
+        if proc.poll() is None:
+            write_event("system", f"killing process group {pid}")
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait(timeout=3)
+
+
+class WindowsProcessSupervisor(ProcessSupervisor):
+    def popen_kwargs(self, detached: bool = False) -> dict[str, Any]:
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if detached:
+            flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
+        return {"creationflags": flags} if flags else {}
+
+    def stop_process(self, proc: subprocess.Popen[bytes], write_event: Any, grace: float) -> None:
+        pid = proc.pid
+        write_event("system", f"terminating process tree {pid}")
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        deadline = time.time() + max(0.0, grace)
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.05)
+        if proc.poll() is None:
+            write_event("system", f"killing process tree {pid}")
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+            except Exception as exc:
+                write_event("system", f"taskkill failed: {exc}")
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+class PlatformServices:
+    def __init__(self, paths: dict[str, Path]) -> None:
+        if IS_WINDOWS:
+            self.lock: DaemonLock = WindowsDaemonLock(paths["lock"])
+            self.endpoint: IpcEndpoint = TcpEndpoint(paths["endpoint"])
+            self.processes: ProcessSupervisor = WindowsProcessSupervisor()
+        else:
+            self.lock = PosixDaemonLock(paths["lock"])
+            self.endpoint = UnixSocketEndpoint(paths["socket"])
+            self.processes = PosixProcessSupervisor()
+
+
+@dataclass
+class StdinJob:
+    payload: bytes
+    display_text: str
+    done: threading.Event = field(default_factory=threading.Event)
+    written: bool = False
+    error: str | None = None
+
+
 @dataclass
 class HostedProcess:
     name: str
     argv: list[str]
     cwd: Path
     log_path: Path
+    supervisor: ProcessSupervisor
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
     rotate_count: int = DEFAULT_ROTATE_COUNT
     tail_chars: int = DEFAULT_TAIL_CHARS
@@ -98,9 +362,13 @@ class HostedProcess:
     current_base_offset: int = 0
     _fd: int | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
+    _stdin_queue: queue.Queue[StdinJob | None] = field(
+        default_factory=lambda: queue.Queue(maxsize=STDIN_QUEUE_LIMIT)
+    )
     _cond: threading.Condition = field(init=False)
     _tail: deque[str] = field(default_factory=deque)
     _tail_len: int = 0
+    _line_open: dict[str, bool] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._cond = threading.Condition(self._lock)
@@ -148,10 +416,11 @@ class HostedProcess:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
-            start_new_session=True,
+            **self.supervisor.popen_kwargs(),
         )
         threading.Thread(target=self._reader, args=("stdout", self.proc.stdout), daemon=True).start()
         threading.Thread(target=self._reader, args=("stderr", self.proc.stderr), daemon=True).start()
+        threading.Thread(target=self._stdin_writer, daemon=True).start()
         threading.Thread(target=self._monitor, daemon=True).start()
 
     def _reader(self, stream_name: str, stream: Any) -> None:
@@ -169,7 +438,30 @@ class HostedProcess:
         code = self.proc.wait()
         self.exit_code = code
         self.exited_at = time.time()
+        try:
+            self._stdin_queue.put_nowait(None)
+        except queue.Full:
+            pass
         self.write_event("system", f"process exited with code {code}")
+
+    def _stdin_writer(self) -> None:
+        while True:
+            job = self._stdin_queue.get()
+            if job is None:
+                return
+            try:
+                proc = self.proc
+                if proc is None or proc.stdin is None or proc.poll() is not None:
+                    job.error = f"{self.name} is not running"
+                    continue
+                proc.stdin.write(job.payload)
+                proc.stdin.flush()
+                self.write_event("stdin", job.display_text)
+                job.written = True
+            except Exception as exc:
+                job.error = f"stdin write failed: {exc}"
+            finally:
+                job.done.set()
 
     def _rotate_if_needed(self, incoming_len: int) -> None:
         if self.max_log_bytes <= 0:
@@ -209,16 +501,26 @@ class HostedProcess:
 
     def write_chunk(self, stream_name: str, chunk: bytes) -> None:
         prefix = f"[{now_stamp()} {stream_name}] ".encode("utf-8")
-        data = prefix + chunk.replace(b"\n", b"\n" + prefix)
-        if data.endswith(prefix):
-            data = data[: -len(prefix)]
+        chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        data = bytearray()
+        if not self._line_open.get(stream_name, False):
+            data.extend(prefix)
+        parts = chunk.split(b"\n")
+        for index, part in enumerate(parts):
+            if index > 0:
+                data.extend(b"\n")
+                if part:
+                    data.extend(prefix)
+            data.extend(part)
+        self._line_open[stream_name] = not chunk.endswith(b"\n")
+        data_bytes = bytes(data)
         with self._cond:
-            self._rotate_if_needed(len(data))
+            self._rotate_if_needed(len(data_bytes))
             if self._fd is None:
                 self._fd = os.open(self.log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
-            os.write(self._fd, data)
-            self.bytes_written += len(data)
-            self._add_tail(data.decode("utf-8", errors="replace"))
+            os.write(self._fd, data_bytes)
+            self.bytes_written += len(data_bytes)
+            self._add_tail(data_bytes.decode("utf-8", errors="replace"))
             self._cond.notify_all()
 
     def read_tail(self, max_bytes: int) -> str:
@@ -267,36 +569,26 @@ class HostedProcess:
         if not self.running or self.proc is None or self.proc.stdin is None:
             raise RpcError(f"{self.name} is not running")
         payload = text + ("\n" if append_newline else "")
+        job = StdinJob(payload=payload.encode("utf-8"), display_text=payload.rstrip("\n"))
         with self._lock:
             offset = self.bytes_written
-        self.proc.stdin.write(payload.encode("utf-8"))
-        self.proc.stdin.flush()
-        self.write_event("stdin", payload.rstrip("\n"))
+        try:
+            self._stdin_queue.put_nowait(job)
+        except queue.Full as exc:
+            raise RpcError(f"{self.name} stdin queue is full") from exc
+
+        if not job.done.wait(STDIN_WRITE_ACK_TIMEOUT):
+            return {"offset": offset, "queued": True, "written": False, "output": self.read_since(offset, max_bytes)}
+        if job.error is not None:
+            raise RpcError(job.error)
         if wait > 0:
             self.wait_for_output_after(offset, wait)
-        return {"offset": offset, "output": self.read_since(offset, max_bytes)}
+        return {"offset": offset, "queued": True, "written": job.written, "output": self.read_since(offset, max_bytes)}
 
     def stop(self, grace: float) -> dict[str, Any]:
         if not self.running or self.proc is None:
             return {"stopped": False, "reason": "not running", "status": self.status()}
-        pid = self.proc.pid
-        self.write_event("system", f"stopping process group {pid}")
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        deadline = time.time() + max(0.0, grace)
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                break
-            time.sleep(0.05)
-        if self.proc.poll() is None:
-            self.write_event("system", f"killing process group {pid}")
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            self.proc.wait(timeout=3)
+        self.supervisor.stop_process(self.proc, self.write_event, grace)
         return {"stopped": True, "status": self.status()}
 
 
@@ -304,36 +596,26 @@ class ProcHostDaemon:
     def __init__(self, root: Path, max_log_bytes: int, rotate_count: int) -> None:
         self.root = root.resolve()
         self.paths = state_paths(self.root)
+        self.platform = PlatformServices(self.paths)
         self.max_log_bytes = max_log_bytes
         self.rotate_count = rotate_count
         self.processes: dict[str, HostedProcess] = {}
         self._shutdown = threading.Event()
-        self._lock_fh: Any = None
 
     def acquire_lock(self) -> None:
-        if fcntl is None:
-            raise RpcError("fcntl is required for daemon locking")
         self.paths["state"].mkdir(parents=True, exist_ok=True)
         self.paths["logs"].mkdir(parents=True, exist_ok=True)
-        self._lock_fh = self.paths["lock"].open("w")
-        try:
-            fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RpcError(f"daemon lock is already held for {self.root}") from exc
+        self.platform.lock.acquire()
         self.paths["pid"].write_text(str(os.getpid()) + "\n", encoding="utf-8")
 
     def serve(self) -> int:
         self.acquire_lock()
-        sock_path = self.paths["socket"]
-        if sock_path.exists():
-            sock_path.unlink()
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server.bind(str(sock_path))
-        os.chmod(sock_path, 0o600)
-        server.listen(16)
-        server.settimeout(0.5)
-        write_daemon_log(self.paths, f"daemon started pid={os.getpid()} root={self.root}")
+        server: socket.socket | None = None
         try:
+            server = self.platform.endpoint.bind_server()
+            server.listen(16)
+            server.settimeout(0.5)
+            write_daemon_log(self.paths, f"daemon started pid={os.getpid()} root={self.root}")
             while not self._shutdown.is_set():
                 try:
                     conn, _addr = server.accept()
@@ -344,9 +626,10 @@ class ProcHostDaemon:
             write_daemon_log(self.paths, "daemon stopping")
             for entry in list(self.processes.values()):
                 entry.close_log()
-            server.close()
-            if sock_path.exists():
-                sock_path.unlink()
+            if server is not None:
+                server.close()
+            self.platform.endpoint.cleanup()
+            self.platform.lock.release()
         return 0
 
     def _handle_conn(self, conn: socket.socket) -> None:
@@ -358,9 +641,11 @@ class ProcHostDaemon:
                     if not chunk:
                         break
                     raw += chunk
-                    if len(raw) > 8 * 1024 * 1024:
+                    if len(raw) > REQUEST_LIMIT_BYTES:
                         raise RpcError("request too large")
-                response = {"ok": True, "data": self.handle(decode_request(raw))}
+                req = decode_request(raw)
+                self.platform.endpoint.validate_server_request(req)
+                response = {"ok": True, "data": self.handle(req)}
             except Exception as exc:
                 response = {"ok": False, "error": str(exc)}
             conn.sendall(encode_response(response))
@@ -426,6 +711,7 @@ class ProcHostDaemon:
             argv=argv,
             cwd=cwd,
             log_path=log_path,
+            supervisor=self.platform.processes,
             max_log_bytes=int(req.get("maxLogBytes", self.max_log_bytes)),
             rotate_count=int(req.get("rotateCount", self.rotate_count)),
         )
@@ -439,6 +725,7 @@ class ProcHostClient:
         self.root = root.resolve()
         self.script = script.resolve()
         self.paths = state_paths(self.root)
+        self.platform = PlatformServices(self.paths)
         self.timeout = timeout
 
     def daemon_running(self) -> bool:
@@ -469,7 +756,7 @@ class ProcHostClient:
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            **self.platform.processes.popen_kwargs(detached=True),
         )
         deadline = time.time() + self.timeout
         last_error = "daemon did not start"
@@ -482,14 +769,9 @@ class ProcHostClient:
         raise RpcError(last_error)
 
     def request(self, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        sock_path = self.paths["socket"]
-        if not sock_path.exists():
-            raise RpcError(f"daemon socket does not exist: {sock_path}")
-        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        client.settimeout(self.timeout if timeout is None else timeout)
+        client = self.platform.endpoint.connect_client(self.timeout if timeout is None else timeout)
         try:
-            client.connect(str(sock_path))
-            client.sendall(encode_response(payload))
+            client.sendall(encode_response(self.platform.endpoint.prepare_client_request(payload)))
             client.shutdown(socket.SHUT_WR)
             raw = b""
             while True:

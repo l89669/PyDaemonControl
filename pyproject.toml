@@ -16,6 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "Environment :: Console",
   "Topic :: System :: Systems Administration",
 ]
