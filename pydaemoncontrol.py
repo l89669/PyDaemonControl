@@ -62,6 +62,8 @@ DEFAULT_RESTART_WINDOW = 60.0
 RESTART_MODES = {"never", "on-failure", "always"}
 IS_WINDOWS = os.name == "nt"
 LOG_OPEN_FLAGS = os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
+OUTPUT_STREAMS = ("stdout", "stderr", "system", "stdin")
+MAX_RECORD_TEXT_BYTES = 4096
 
 
 class RpcError(Exception):
@@ -126,6 +128,84 @@ def format_stdin_log(text: str) -> str:
         text[:MAX_STDIN_LOG_CHARS]
         + f"\n[pydaemoncontrol] stdin log truncated; originalChars={len(text)}"
     )
+
+
+@dataclass(frozen=True)
+class OutputRecord:
+    seq: int
+    stream: str
+    text: str
+
+
+def utf8_len(text: str) -> int:
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def split_text_by_utf8_limit(text: str, limit: int = MAX_RECORD_TEXT_BYTES) -> list[str]:
+    if not text:
+        return []
+    parts: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for ch in text:
+        ch_size = utf8_len(ch)
+        if current and current_size + ch_size > limit:
+            parts.append("".join(current))
+            current = []
+            current_size = 0
+        current.append(ch)
+        current_size += ch_size
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def split_output_text(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return split_text_by_utf8_limit(normalized)
+
+
+def record_text_bytes(records: list[OutputRecord]) -> int:
+    return sum(utf8_len(record.text) for record in records)
+
+
+def records_to_wire(records: list[OutputRecord], next_seq: int, *, rotated: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {stream: [] for stream in OUTPUT_STREAMS}
+    for record in sorted(records, key=lambda item: item.seq):
+        if record.stream not in payload:
+            payload[record.stream] = []
+        payload[record.stream].append([record.seq, record.text])
+    payload["nextSeq"] = next_seq
+    payload["rotated"] = rotated
+    return payload
+
+
+def iter_wire_records(data: dict[str, Any]) -> list[OutputRecord]:
+    records: list[OutputRecord] = []
+    for stream in OUTPUT_STREAMS:
+        raw_records = data.get(stream, [])
+        if not isinstance(raw_records, list):
+            continue
+        for item in raw_records:
+            if not isinstance(item, list) or len(item) != 2:
+                continue
+            try:
+                seq = int(item[0])
+            except (TypeError, ValueError):
+                continue
+            records.append(OutputRecord(seq=seq, stream=stream, text=str(item[1])))
+    records.sort(key=lambda item: item.seq)
+    return records
+
+
+def render_records_combined(data: dict[str, Any], *, annotate_internal: bool = False) -> str:
+    chunks: list[str] = []
+    for record in iter_wire_records(data):
+        if annotate_internal and record.stream in {"system", "stdin"}:
+            chunks.append(f"[pydaemoncontrol {record.stream}] {record.text}")
+        else:
+            chunks.append(record.text)
+    return "".join(chunks)
 
 
 def default_restart_policy() -> dict[str, Any]:
@@ -253,9 +333,9 @@ def normalize_process_spec(
     }
 
 
-def profile_to_request(action: str, profile: dict[str, Any], grace: float | None = None) -> dict[str, Any]:
-    request = {
-        "action": action,
+def profile_to_start_request(profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": "start",
         "name": profile["name"],
         "cwd": profile["cwd"],
         "argv": profile["argv"],
@@ -263,9 +343,6 @@ def profile_to_request(action: str, profile: dict[str, Any], grace: float | None
         "rotateCount": profile["rotateCount"],
         "restart": profile["restart"],
     }
-    if grace is not None:
-        request["grace"] = grace
-    return request
 
 
 def restart_policy_from_args(args: Any) -> dict[str, Any]:
@@ -290,11 +367,9 @@ def get_profile(paths: dict[str, Path], name: str) -> dict[str, Any]:
     return profile
 
 
-def add_process_spec_arguments(parser: argparse.ArgumentParser, *, include_grace: bool = False) -> None:
+def add_process_spec_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("name")
     parser.add_argument("--cwd", default=None)
-    if include_grace:
-        parser.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
     parser.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     parser.add_argument("--rotate-count", type=int, default=DEFAULT_ROTATE_COUNT)
     parser.add_argument("--restart", choices=sorted(RESTART_MODES), default=DEFAULT_RESTART_MODE)
@@ -303,10 +378,8 @@ def add_process_spec_arguments(parser: argparse.ArgumentParser, *, include_grace
     parser.add_argument("--restart-window", type=float, default=DEFAULT_RESTART_WINDOW)
 
 
-def add_outer_process_option_arguments(parser: argparse.ArgumentParser, *, include_grace: bool = False) -> None:
+def add_outer_process_option_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cwd", dest="proc_cwd")
-    if include_grace:
-        parser.add_argument("--grace", type=float, dest="proc_grace")
     parser.add_argument("--max-log-bytes", type=int, dest="proc_max_log_bytes")
     parser.add_argument("--rotate-count", type=int, dest="proc_rotate_count")
     parser.add_argument("--restart", choices=sorted(RESTART_MODES), dest="proc_restart")
@@ -318,7 +391,6 @@ def add_outer_process_option_arguments(parser: argparse.ArgumentParser, *, inclu
 def apply_outer_process_options(spec_args: Any, outer_args: Any) -> Any:
     mapping = {
         "proc_cwd": "cwd",
-        "proc_grace": "grace",
         "proc_max_log_bytes": "max_log_bytes",
         "proc_rotate_count": "rotate_count",
         "proc_restart": "restart",
@@ -333,7 +405,7 @@ def apply_outer_process_options(spec_args: Any, outer_args: Any) -> Any:
     return spec_args
 
 
-def parse_process_spec_tokens(tokens: list[str], prog: str, *, include_grace: bool = False) -> tuple[Any, list[str]]:
+def parse_process_spec_tokens(tokens: list[str], prog: str) -> tuple[Any, list[str]]:
     if "--" in tokens:
         marker = tokens.index("--")
         spec_tokens = tokens[:marker]
@@ -342,7 +414,7 @@ def parse_process_spec_tokens(tokens: list[str], prog: str, *, include_grace: bo
         spec_tokens = tokens
         proc_argv = []
     parser = argparse.ArgumentParser(prog=prog)
-    add_process_spec_arguments(parser, include_grace=include_grace)
+    add_process_spec_arguments(parser)
     return parser.parse_args(spec_tokens), proc_argv
 
 
@@ -595,7 +667,7 @@ class StdinJob:
     done: threading.Event = field(default_factory=threading.Event)
     written: bool = False
     error: str | None = None
-    log_end_offset: int | None = None
+    log_end_seq: int | None = None
 
 
 @dataclass
@@ -617,55 +689,61 @@ class HostedProcess:
     restart_count: int = 0
     last_restart_at: float | None = None
     restart_pending_until: float | None = None
-    bytes_written: int = 0
-    current_base_offset: int = 0
-    _fd: int | None = None
+    next_seq: int = 0
+    _fds: dict[str, int] = field(default_factory=dict)
+    _stream_bytes: dict[str, int] = field(default_factory=dict)
+    _logs_closed: bool = False
     _lock: threading.RLock = field(default_factory=threading.RLock)
     _stdin_queue: queue.Queue[StdinJob | None] = field(
         default_factory=lambda: queue.Queue(maxsize=STDIN_QUEUE_LIMIT)
     )
     _cond: threading.Condition = field(init=False)
-    _tail: deque[str] = field(default_factory=deque)
-    _tail_len: int = 0
-    _line_open: dict[str, bool] = field(default_factory=dict)
+    _tail_records: deque[OutputRecord] = field(default_factory=deque)
+    _tail_bytes: int = 0
     _restart_attempts: deque[float] = field(default_factory=deque)
 
     def __post_init__(self) -> None:
         self._cond = threading.Condition(self._lock)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.log_path, LOG_OPEN_FLAGS, 0o644)
-        self.bytes_written = self.log_path.stat().st_size if self.log_path.exists() else 0
+        self._stream_bytes = {
+            stream: self._stream_log_path(stream).stat().st_size
+            if self._stream_log_path(stream).exists()
+            else 0
+            for stream in OUTPUT_STREAMS
+        }
 
     def close_log(self) -> None:
         with self._lock:
-            if self._fd is not None:
-                os.close(self._fd)
-                self._fd = None
+            self._logs_closed = True
+            for fd in self._fds.values():
+                os.close(fd)
+            self._fds.clear()
 
     @property
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
     def status(self) -> dict[str, Any]:
-        pid = self.proc.pid if self.proc is not None else None
-        return {
-            "name": self.name,
-            "pid": pid,
-            "running": self.running,
-            "exitCode": self.proc.poll() if self.proc is not None else self.exit_code,
-            "startedAt": self.started_at,
-            "exitedAt": self.exited_at,
-            "cwd": str(self.cwd),
-            "argv": self.argv,
-            "logPath": str(self.log_path),
-            "bytesWritten": self.bytes_written,
-            "currentBaseOffset": self.current_base_offset,
-            "restartPolicy": self.restart_policy,
-            "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
-            "restartCount": self.restart_count,
-            "lastRestartAt": self.last_restart_at,
-            "restartPendingUntil": self.restart_pending_until,
-        }
+        with self._lock:
+            pid = self.proc.pid if self.proc is not None else None
+            return {
+                "name": self.name,
+                "pid": pid,
+                "running": self.running,
+                "exitCode": self.proc.poll() if self.proc is not None else self.exit_code,
+                "startedAt": self.started_at,
+                "exitedAt": self.exited_at,
+                "cwd": str(self.cwd),
+                "argv": self.argv,
+                "logPaths": {stream: str(self._stream_log_path(stream)) for stream in OUTPUT_STREAMS},
+                "nextSeq": self.next_seq,
+                "tailStartSeq": self._tail_records[0].seq if self._tail_records else self.next_seq,
+                "restartPolicy": self.restart_policy,
+                "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
+                "restartCount": self.restart_count,
+                "lastRestartAt": self.last_restart_at,
+                "restartPendingUntil": self.restart_pending_until,
+            }
 
     def start(self, restarted: bool = False) -> None:
         if self.proc is not None and self.proc.poll() is None:
@@ -680,7 +758,7 @@ class HostedProcess:
             self.last_restart_at = self.started_at
             self.restart_count += 1
         self.write_event("system", ("restarting: " if restarted else "starting: ") + " ".join(self.argv))
-        self.proc = subprocess.Popen(
+        proc = subprocess.Popen(
             self.argv,
             cwd=str(self.cwd),
             stdin=subprocess.PIPE,
@@ -689,10 +767,12 @@ class HostedProcess:
             bufsize=0,
             **self.supervisor.popen_kwargs(),
         )
-        threading.Thread(target=self._reader, args=("stdout", self.proc.stdout), daemon=True).start()
-        threading.Thread(target=self._reader, args=("stderr", self.proc.stderr), daemon=True).start()
-        threading.Thread(target=self._stdin_writer, daemon=True).start()
-        threading.Thread(target=self._monitor, daemon=True).start()
+        self.proc = proc
+        stdin_queue = self._stdin_queue
+        threading.Thread(target=self._reader, args=("stdout", proc.stdout), daemon=True).start()
+        threading.Thread(target=self._reader, args=("stderr", proc.stderr), daemon=True).start()
+        threading.Thread(target=self._stdin_writer, args=(proc, stdin_queue), daemon=True).start()
+        threading.Thread(target=self._monitor, args=(proc, stdin_queue), daemon=True).start()
 
     def _reader(self, stream_name: str, stream: Any) -> None:
         try:
@@ -704,13 +784,15 @@ class HostedProcess:
         except Exception as exc:
             self.write_event("system", f"{stream_name} reader failed: {exc}")
 
-    def _monitor(self) -> None:
-        assert self.proc is not None
-        code = self.proc.wait()
+    def _monitor(self, proc: subprocess.Popen[bytes], stdin_queue: queue.Queue[StdinJob | None]) -> None:
+        code = proc.wait()
+        if self.proc is not proc:
+            self.write_event("system", f"previous process exited with code {code}")
+            return
         self.exit_code = code
         self.exited_at = time.time()
         try:
-            self._stdin_queue.put_nowait(None)
+            stdin_queue.put_nowait(None)
         except queue.Full:
             pass
         self.write_event("system", f"process exited with code {code}")
@@ -762,154 +844,192 @@ class HostedProcess:
             self.restart_pending_until = None
             self.write_event("system", f"restart failed: {exc}")
 
-    def _stdin_writer(self) -> None:
+    def _stdin_writer(self, proc: subprocess.Popen[bytes], stdin_queue: queue.Queue[StdinJob | None]) -> None:
         while True:
-            job = self._stdin_queue.get()
+            job = stdin_queue.get()
             if job is None:
                 return
             try:
-                proc = self.proc
-                if proc is None or proc.stdin is None or proc.poll() is not None:
+                if proc is not self.proc or proc.stdin is None or proc.poll() is not None:
                     job.error = f"{self.name} is not running"
                     continue
                 proc.stdin.write(job.payload)
                 proc.stdin.flush()
-                job.log_end_offset = self.write_event("stdin", job.display_text)
+                job.log_end_seq = self.write_event("stdin", job.display_text)
                 job.written = True
             except Exception as exc:
                 job.error = f"stdin write failed: {exc}"
             finally:
                 job.done.set()
 
-    def _rotate_if_needed(self, incoming_len: int) -> None:
+    def _stream_log_path(self, stream_name: str) -> Path:
+        return self.log_path.with_name(f"{self.log_path.stem}.{stream_name}{self.log_path.suffix}")
+
+    def _rotate_if_needed(self, stream_name: str, incoming_len: int) -> None:
         if self.max_log_bytes <= 0:
             return
-        try:
-            current_size = self.log_path.stat().st_size if self.log_path.exists() else 0
-        except FileNotFoundError:
-            current_size = 0
+        current_size = self._stream_bytes.get(stream_name, 0)
         if current_size + incoming_len <= self.max_log_bytes:
             return
-        if self._fd is not None:
-            os.close(self._fd)
-            self._fd = None
+        fd = self._fds.pop(stream_name, None)
+        if fd is not None:
+            os.close(fd)
+        path = self._stream_log_path(stream_name)
+        if self.rotate_count <= 0:
+            if path.exists():
+                path.unlink()
+            self._stream_bytes[stream_name] = 0
+            return
         for index in range(self.rotate_count, 0, -1):
-            src = self.log_path.with_name(self.log_path.name + ("" if index == 1 else f".{index - 1}"))
-            dst = self.log_path.with_name(self.log_path.name + f".{index}")
+            src = path.with_name(path.name + ("" if index == 1 else f".{index - 1}"))
+            dst = path.with_name(path.name + f".{index}")
             if index == 1:
-                src = self.log_path
+                src = path
             if src.exists():
                 if dst.exists():
                     dst.unlink()
                 src.rename(dst)
-        self.current_base_offset = self.bytes_written
-        self._fd = os.open(self.log_path, LOG_OPEN_FLAGS, 0o644)
+        self._stream_bytes[stream_name] = 0
 
-    def _add_tail(self, text: str) -> None:
-        if not text:
+    def _add_tail_record(self, record: OutputRecord) -> None:
+        size = utf8_len(record.text)
+        self._tail_records.append(record)
+        self._tail_bytes += size
+        while self._tail_bytes > self.tail_chars and len(self._tail_records) > 1:
+            removed = self._tail_records.popleft()
+            self._tail_bytes -= utf8_len(removed.text)
+
+    def _record_log_bytes(self, record: OutputRecord) -> bytes:
+        return (
+            json.dumps([record.seq, record.text], ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+
+    def _write_record_to_log(self, record: OutputRecord) -> None:
+        if self._logs_closed:
             return
-        self._tail.append(text)
-        self._tail_len += len(text)
-        while self._tail_len > self.tail_chars and self._tail:
-            removed = self._tail.popleft()
-            self._tail_len -= len(removed)
+        encoded = self._record_log_bytes(record)
+        self._rotate_if_needed(record.stream, len(encoded))
+        fd = self._fds.get(record.stream)
+        if fd is None:
+            fd = os.open(self._stream_log_path(record.stream), LOG_OPEN_FLAGS, 0o644)
+            self._fds[record.stream] = fd
+        os.write(fd, encoded)
+        self._stream_bytes[record.stream] = self._stream_bytes.get(record.stream, 0) + len(encoded)
+
+    def _append_records_locked(self, stream_name: str, texts: list[str]) -> int:
+        for text in texts:
+            if not text:
+                continue
+            record = OutputRecord(seq=self.next_seq, stream=stream_name, text=text)
+            self.next_seq += 1
+            self._write_record_to_log(record)
+            self._add_tail_record(record)
+        self._cond.notify_all()
+        return self.next_seq
 
     def write_event(self, stream_name: str, text: str) -> int:
-        return self.write_chunk(stream_name, (text.rstrip("\n") + "\n").encode("utf-8", errors="replace"))
+        return self.write_records(stream_name, [text.rstrip("\n") + "\n"])
 
     def write_chunk(self, stream_name: str, chunk: bytes) -> int:
-        prefix = f"[{now_stamp()} {stream_name}] ".encode("utf-8")
-        chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        text = chunk.decode("utf-8", errors="replace")
+        return self.write_records(stream_name, split_output_text(text))
+
+    def write_records(self, stream_name: str, texts: list[str]) -> int:
+        if stream_name not in OUTPUT_STREAMS:
+            raise RpcError(f"unknown output stream: {stream_name}")
         with self._cond:
-            data = bytearray()
-            if not self._line_open.get(stream_name, False):
-                data.extend(prefix)
-            parts = chunk.split(b"\n")
-            for index, part in enumerate(parts):
-                if index > 0:
-                    data.extend(b"\n")
-                    if part:
-                        data.extend(prefix)
-                data.extend(part)
-            self._line_open[stream_name] = not chunk.endswith(b"\n")
-            data_bytes = bytes(data)
-            self._rotate_if_needed(len(data_bytes))
-            if self._fd is None:
-                self._fd = os.open(self.log_path, LOG_OPEN_FLAGS, 0o644)
-            os.write(self._fd, data_bytes)
-            self.bytes_written += len(data_bytes)
-            self._add_tail(data_bytes.decode("utf-8", errors="replace"))
-            self._cond.notify_all()
-            return self.bytes_written
+            return self._append_records_locked(stream_name, texts)
 
-    def read_tail(self, max_bytes: int) -> str:
+    def _limit_records_from_end(self, records: list[OutputRecord], max_bytes: int) -> list[OutputRecord]:
+        selected: list[OutputRecord] = []
+        total = 0
+        for record in reversed(records):
+            size = utf8_len(record.text)
+            if selected and total + size > max_bytes:
+                break
+            if not selected and size > max_bytes:
+                text_bytes = record.text.encode("utf-8", errors="replace")[-max_bytes:]
+                selected.append(
+                    OutputRecord(
+                        seq=record.seq,
+                        stream=record.stream,
+                        text=text_bytes.decode("utf-8", errors="replace"),
+                    )
+                )
+                break
+            selected.append(record)
+            total += size
+        selected.reverse()
+        return selected
+
+    def _limit_records_from_start(self, records: list[OutputRecord], max_bytes: int) -> tuple[list[OutputRecord], bool]:
+        selected: list[OutputRecord] = []
+        total = 0
+        truncated = False
+        for record in records:
+            size = utf8_len(record.text)
+            if selected and total + size > max_bytes:
+                truncated = True
+                break
+            if not selected and size > max_bytes:
+                text_bytes = record.text.encode("utf-8", errors="replace")[:max_bytes]
+                selected.append(
+                    OutputRecord(
+                        seq=record.seq,
+                        stream=record.stream,
+                        text=text_bytes.decode("utf-8", errors="replace"),
+                    )
+                )
+                truncated = True
+                break
+            selected.append(record)
+            total += size
+        return selected, truncated
+
+    def read_tail(self, max_bytes: int) -> dict[str, Any]:
         max_bytes = max(1, max_bytes)
         with self._lock:
-            joined = "".join(self._tail)
-        raw = joined.encode("utf-8", errors="replace")
-        return raw[-max_bytes:].decode("utf-8", errors="replace")
+            records = self._limit_records_from_end(list(self._tail_records), max_bytes)
+            next_seq = self.next_seq
+        return records_to_wire(records, next_seq, rotated=False)
 
-    def read_from(self, offset: int, max_bytes: int) -> dict[str, Any]:
+    def read_from(self, since_seq: int, max_bytes: int) -> dict[str, Any]:
         max_bytes = max(1, max_bytes)
-        offset = max(0, offset)
+        since_seq = max(0, since_seq)
         with self._lock:
-            base = self.current_base_offset
-            written = self.bytes_written
-        if offset < base:
-            return {
-                "output": "[pydaemoncontrol] requested offset was rotated; showing recent output\n"
-                + self.read_tail(max_bytes),
-                "offset": offset,
-                "nextOffset": written,
-                "rotated": True,
-                "status": self.status(),
-            }
-        if offset >= written:
-            return {
-                "output": "",
-                "offset": offset,
-                "nextOffset": written,
-                "rotated": False,
-                "status": self.status(),
-            }
-        local_offset = offset - base
-        read_len = min(max_bytes, written - offset)
-        try:
-            with self.log_path.open("rb") as fh:
-                fh.seek(local_offset)
-                raw = fh.read(read_len)
-        except FileNotFoundError:
-            return {
-                "output": "",
-                "offset": offset,
-                "nextOffset": written,
-                "rotated": True,
-                "status": self.status(),
-            }
-        return {
-            "output": raw.decode("utf-8", errors="replace"),
-            "offset": offset,
-            "nextOffset": offset + len(raw),
-            "rotated": False,
-            "status": self.status(),
-        }
+            # Reads come from the in-memory record tail. Log files are write-through
+            # history, not the live read source, so rotation cannot swap the file under
+            # a reader and make seq-based reads return bytes from the wrong file.
+            tail_records = list(self._tail_records)
+            next_seq = self.next_seq
+            tail_start_seq = tail_records[0].seq if tail_records else next_seq
+            rotated = since_seq < tail_start_seq
+            records = [record for record in tail_records if record.seq >= max(since_seq, tail_start_seq)]
+            records, truncated = self._limit_records_from_start(records, max_bytes)
+            if records:
+                response_next_seq = records[-1].seq + 1 if truncated else next_seq
+            else:
+                response_next_seq = next_seq
+            status = self.status()
+        payload = records_to_wire(records, response_next_seq, rotated=rotated)
+        payload["truncated"] = truncated
+        payload["status"] = status
+        return payload
 
-    def read_since(self, offset: int, max_bytes: int) -> str:
-        return str(self.read_from(offset, max_bytes)["output"])
-
-    def wait_for_output_after(self, offset: int, timeout: float, quiet: float = DEFAULT_OUTPUT_QUIET) -> None:
+    def wait_for_output_after(self, seq: int, timeout: float, quiet: float = DEFAULT_OUTPUT_QUIET) -> None:
         end = time.time() + max(0.0, timeout)
         seen = False
-        last_written = offset
+        last_seq = seq
         with self._cond:
             while time.time() < end:
                 remaining = end - time.time()
                 if remaining <= 0:
                     break
                 self._cond.wait(min(quiet, remaining))
-                if self.bytes_written > last_written:
+                if self.next_seq > last_seq:
                     seen = True
-                    last_written = self.bytes_written
+                    last_seq = self.next_seq
                     continue
                 if seen:
                     break
@@ -929,7 +1049,7 @@ class HostedProcess:
         payload = text + ("\n" if append_newline else "")
         job = StdinJob(payload=payload.encode("utf-8"), display_text=format_stdin_log(payload.rstrip("\n")))
         with self._lock:
-            offset = self.bytes_written
+            since_seq = self.next_seq
         try:
             self._stdin_queue.put_nowait(job)
         except queue.Full as exc:
@@ -939,28 +1059,32 @@ class HostedProcess:
             self.write_event("system", "next process exit will suppress restart")
 
         if not job.done.wait(max(0.0, input_wait)):
-            return {
-                "offset": offset,
-                "queued": True,
-                "written": False,
-                "inputWaitExpired": True,
-                "suppressRestartRequested": suppress_restart,
-                "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
-                "output": self.read_since(offset, max_bytes),
-            }
+            payload_data = self.read_from(since_seq, max_bytes)
+            payload_data.update(
+                {
+                    "queued": True,
+                    "written": False,
+                    "inputWaitExpired": True,
+                    "suppressRestartRequested": suppress_restart,
+                    "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
+                }
+            )
+            return payload_data
         if job.error is not None:
             raise RpcError(job.error)
         if wait > 0:
-            self.wait_for_output_after(job.log_end_offset if job.log_end_offset is not None else offset, wait, quiet)
-        return {
-            "offset": offset,
-            "queued": True,
-            "written": job.written,
-            "inputWaitExpired": False,
-            "suppressRestartRequested": suppress_restart,
-            "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
-            "output": self.read_since(offset, max_bytes),
-        }
+            self.wait_for_output_after(job.log_end_seq if job.log_end_seq is not None else since_seq, wait, quiet)
+        payload_data = self.read_from(since_seq, max_bytes)
+        payload_data.update(
+            {
+                "queued": True,
+                "written": job.written,
+                "inputWaitExpired": False,
+                "suppressRestartRequested": suppress_restart,
+                "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
+            }
+        )
+        return payload_data
 
     def stop(self, grace: float, suppress_restart: bool = False) -> dict[str, Any]:
         if not self.running or self.proc is None:
@@ -974,6 +1098,14 @@ class HostedProcess:
         self.restart_pending_until = None
         self.supervisor.stop_process(self.proc, self.write_event, grace)
         return {"stopped": True, "status": self.status()}
+
+    def restart(self, grace: float) -> dict[str, Any]:
+        if self.running and self.proc is not None:
+            self.suppress_restart_on_next_exit = True
+            self.restart_pending_until = None
+            self.supervisor.stop_process(self.proc, self.write_event, grace)
+        self.start(restarted=True)
+        return {"restarted": True, "status": self.status()}
 
 
 class ProcHostDaemon:
@@ -1049,17 +1181,11 @@ class ProcHostDaemon:
                 "processes": {name: proc.status() for name, proc in self.processes.items()},
             }
         if action == "start":
-            return self._start(req, replace=False)
+            return self._start(req)
         if action == "restart":
             name = sanitize_name(str(req.get("name", "")))
-            if name in self.processes:
-                old_entry = self.processes[name]
-                old_entry.stop(
-                    require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False),
-                    suppress_restart=True,
-                )
-                old_entry.close_log()
-            return self._start(req, replace=True)
+            entry = self.get_process(name)
+            return entry.restart(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
         if action == "send":
             entry = self.get_process(str(req.get("name", "")))
             return entry.send(
@@ -1073,14 +1199,11 @@ class ProcHostDaemon:
             )
         if action == "tail":
             entry = self.get_process(str(req.get("name", "")))
-            return {
-                "output": entry.read_tail(require_output_bytes(req.get("maxBytes", 65536))),
-                "status": entry.status(),
-            }
+            return entry.read_tail(require_output_bytes(req.get("maxBytes", 65536)))
         if action == "read":
             entry = self.get_process(str(req.get("name", "")))
             return entry.read_from(
-                require_int_at_least(req.get("offset", 0), "offset", 0),
+                require_int_at_least(req.get("sinceSeq", 0), "sinceSeq", 0),
                 require_output_bytes(req.get("maxBytes", 65536)),
             )
         if action == "stop":
@@ -1098,7 +1221,7 @@ class ProcHostDaemon:
             return {"stopping": True, "daemonPid": os.getpid()}
         raise RpcError(f"unknown action: {action}")
 
-    def _start(self, req: dict[str, Any], replace: bool) -> dict[str, Any]:
+    def _start(self, req: dict[str, Any]) -> dict[str, Any]:
         spec = normalize_process_spec(
             self.root,
             str(req.get("name", "")),
@@ -1109,8 +1232,11 @@ class ProcHostDaemon:
             req.get("restart"),
         )
         name = spec["name"]
-        if name in self.processes and self.processes[name].running and not replace:
+        if name in self.processes and self.processes[name].running:
             raise RpcError(f"{name} is already running")
+        old_entry = self.processes.get(name)
+        if old_entry is not None:
+            old_entry.close_log()
         log_path = self.paths["logs"] / f"{name}.log"
         entry = HostedProcess(
             name=name,
@@ -1122,8 +1248,12 @@ class ProcHostDaemon:
             max_log_bytes=int(spec["maxLogBytes"]),
             rotate_count=int(spec["rotateCount"]),
         )
+        try:
+            entry.start()
+        except Exception:
+            entry.close_log()
+            raise
         self.processes[name] = entry
-        entry.start()
         return {"started": True, "status": entry.status()}
 
 
@@ -1217,15 +1347,15 @@ def run_attach(
     if not isinstance(proc_status, dict):
         raise RpcError(f"invalid process status for {name}")
 
-    written = int(proc_status.get("bytesWritten", 0))
-    base = int(proc_status.get("currentBaseOffset", 0))
-    offset = written
+    next_seq = int(proc_status.get("nextSeq", 0))
+    tail_start_seq = int(proc_status.get("tailStartSeq", next_seq))
+    since_seq = next_seq
     if history > 0:
-        offset = max(base, written - history)
-        initial = client.request({"action": "read", "name": name, "offset": offset, "maxBytes": history})
-        sys.stdout.write(str(initial.get("output", "")))
+        since_seq = tail_start_seq
+        initial = client.request({"action": "read", "name": name, "sinceSeq": since_seq, "maxBytes": history})
+        sys.stdout.write(render_records_combined(initial, annotate_internal=True))
         sys.stdout.flush()
-        offset = int(initial.get("nextOffset", offset))
+        since_seq = int(initial.get("nextSeq", since_seq))
 
     input_queue: queue.Queue[str | None] = queue.Queue()
 
@@ -1269,12 +1399,12 @@ def run_attach(
                     flush=True,
                 )
 
-        data = client.request({"action": "read", "name": name, "offset": offset, "maxBytes": read_bytes})
-        output = str(data.get("output", ""))
+        data = client.request({"action": "read", "name": name, "sinceSeq": since_seq, "maxBytes": read_bytes})
+        output = render_records_combined(data, annotate_internal=True)
         if output:
             sys.stdout.write(output)
             sys.stdout.flush()
-        offset = int(data.get("nextOffset", offset))
+        since_seq = int(data.get("nextSeq", since_seq))
         proc_status = data.get("status", {})
         running = bool(proc_status.get("running", False)) if isinstance(proc_status, dict) else False
 
@@ -1311,9 +1441,9 @@ def build_parser() -> argparse.ArgumentParser:
     add_outer_process_option_arguments(start)
     start.add_argument("tokens", nargs=argparse.REMAINDER)
 
-    restart = sub.add_parser("restart", help="Stop and start a named process or saved profile")
-    add_outer_process_option_arguments(restart, include_grace=True)
-    restart.add_argument("tokens", nargs=argparse.REMAINDER)
+    restart = sub.add_parser("restart", help="Restart an existing daemon-managed process")
+    restart.add_argument("name")
+    restart.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
 
     profile = sub.add_parser("profile", help="Manage saved process profiles")
     profile_sub = profile.add_subparsers(dest="profile_cmd", required=True)
@@ -1430,11 +1560,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        if args.cmd in {"start", "restart"}:
+        if args.cmd == "start":
             spec_args, proc_argv = parse_process_spec_tokens(
                 args.tokens,
-                f"pydaemoncontrol {args.cmd}",
-                include_grace=args.cmd == "restart",
+                "pydaemoncontrol start",
             )
             spec_args = apply_outer_process_options(spec_args, args)
             if proc_argv:
@@ -1451,11 +1580,23 @@ def main(argv: list[str] | None = None) -> int:
                 profile = get_profile(client.paths, spec_args.name)
             if not client.daemon_running():
                 client.start_daemon(max_log_bytes, rotate_count)
-            grace = require_seconds(getattr(spec_args, "grace", DEFAULT_STOP_GRACE), "grace", positive=False)
             print_json(
                 client.request(
-                    profile_to_request(args.cmd, profile, grace if args.cmd == "restart" else None),
-                    timeout=client.timeout + (grace if args.cmd == "restart" else 0.0),
+                    profile_to_start_request(profile),
+                    timeout=client.timeout,
+                )
+            )
+            return 0
+        if args.cmd == "restart":
+            grace = require_seconds(args.grace, "grace", positive=False)
+            print_json(
+                client.request(
+                    {
+                        "action": "restart",
+                        "name": args.name,
+                        "grace": grace,
+                    },
+                    timeout=client.timeout + grace,
                 )
             )
             return 0
@@ -1484,7 +1625,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "tail":
             max_bytes = require_output_bytes(args.bytes)
             data = client.request({"action": "tail", "name": args.name, "maxBytes": max_bytes})
-            sys.stdout.write(str(data.get("output", "")))
+            print_json(data)
             return 0
         if args.cmd == "attach":
             history = require_history_bytes(args.history)

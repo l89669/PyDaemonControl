@@ -12,10 +12,11 @@ later clients talk to that daemon over a local IPC endpoint.
 
 - Starts one long-lived daemon per root directory.
 - Starts named child processes under that daemon.
-- Sends text to a child process stdin and returns the new output produced after
-  that input.
-- Keeps stdout and stderr in bounded rolling log files.
-- Returns recent output with `tail --bytes N` without streaming large logs back
+- Sends text to a child process stdin and returns new stdout/stderr records
+  produced after that input.
+- Keeps stdout, stderr, system events, and stdin echoes in separate bounded
+  rolling log files.
+- Returns recent records with `tail --bytes N` without streaming large logs back
   through the caller.
 - Stops a child process tree with graceful termination first, then force kill
   after a grace period.
@@ -55,11 +56,27 @@ pydaemoncontrol --root /srv/example profile set app --restart on-failure --resta
 pydaemoncontrol --root /srv/example start app
 ```
 
-Send one line to the process stdin and return output produced after the input:
+Send one line to the process stdin and return records produced after the input:
 
 ```bash
 pydaemoncontrol --root /srv/example cmd app 'status' --wait 1 --bytes 12000
 ```
+
+Output-bearing RPCs return per-stream record arrays:
+
+```json
+{
+  "nextSeq": 124,
+  "stdout": [[120, "READY\n"]],
+  "stderr": [[121, "WARN\n"]],
+  "system": [[119, "starting...\n"]],
+  "stdin": [[122, "status\n"]]
+}
+```
+
+Each record is `[seq, text]`. `seq` is a process-wide monotonic sequence shared
+by all streams. A client can build a combined view by sorting all stream records
+by `seq`; newline state is represented by whether `text` ends with `\n`.
 
 If stdin writing itself may be slow, give that phase its own budget:
 
@@ -74,7 +91,7 @@ that one exit:
 pydaemoncontrol --root /srv/example cmd app 'stop' --suppress-restart --wait 5 --bytes 20000
 ```
 
-Read recent output without sending input:
+Read recent records without sending input:
 
 ```bash
 pydaemoncontrol --root /srv/example tail app --bytes 20000
@@ -90,6 +107,12 @@ Show daemon and process status:
 
 ```bash
 pydaemoncontrol --root /srv/example status
+```
+
+Restart an existing daemon-managed process without changing its command:
+
+```bash
+pydaemoncontrol --root /srv/example restart app --grace 5
 ```
 
 Stop a child process:
@@ -152,16 +175,21 @@ For each root directory, `pydaemoncontrol` creates:
   daemon.log
   profiles.json
   logs/
-    <process>.log
-    <process>.log.1
-    <process>.log.2
+    <process>.stdout.log
+    <process>.stdout.log.1
+    <process>.stderr.log
+    <process>.system.log
+    <process>.stdin.log
 ```
 
 `daemon.sock` is used on POSIX systems. `daemon.endpoint.json` is used on
 Windows and contains a loopback TCP endpoint plus a random per-daemon token.
 
-Only one daemon can hold the lock for a root directory. Process output is written
-to rolling log files. Defaults:
+Only one daemon can hold the lock for a root directory. Process output and
+daemon-side events are written to separate rolling log files. Log records are
+compact JSON lines in `[seq, text]` form. This early state layout intentionally
+does not preserve compatibility with the original combined byte-offset log
+format. Defaults:
 
 - max log file size: `32 MiB`
 - rotated files kept: `3`
@@ -189,12 +217,18 @@ pydaemoncontrol --root /srv/example profile show app
 pydaemoncontrol --root /srv/example profile remove app
 ```
 
-`start app` and `restart app` use the saved profile when no argv is provided. If
-argv is provided, the command remains an immediate one-shot start spec:
+`start app` uses the saved profile when no argv is provided. If argv is
+provided, the command remains an immediate one-shot start spec:
 
 ```bash
 pydaemoncontrol --root /srv/example start app -- ./run-once.sh
 ```
+
+`restart app` is deliberately narrower: it only restarts an existing process
+already managed by the daemon, using that process's current argv, cwd, log
+settings, and restart policy. It does not read a profile and it does not accept a
+replacement command. To change a command, update the profile or issue an
+explicit stop/start sequence.
 
 Process spec options can be placed before or after the name:
 
@@ -236,9 +270,10 @@ unsuppressed `stop`.
 
 ## Command Semantics
 
-`cmd` records the current log offset, writes the requested text to stdin, waits
-for output until a short quiet window or timeout, then returns bytes from that
-offset. If other process output is emitted at the same time, it can be included
+`cmd` records the current process `nextSeq`, writes the requested text to stdin,
+waits for output until a short quiet window or timeout, then returns records from
+that sequence onward, split into `stdout`, `stderr`, `system`, and `stdin`
+arrays. If other process output is emitted at the same time, it can be included
 in the response. That is expected behavior.
 
 Commands sent to the same child process are queued through a per-process stdin
@@ -248,13 +283,15 @@ child process stops reading stdin. In that case the response returns
 `written: false`, and later `status`, `tail`, or `stop` requests can still be
 served.
 
-Large stdin values are truncated in the log, so a command response is not filled
-with the input text before the child process output can be captured.
+Large stdin values are truncated in the stdin event log, so a command response
+is not filled with the input text before the child process output can be
+captured.
 
-`attach` is a polling console built on the same RPC protocol. It reads output by
-offset and sends each entered line through the same stdin queue as `cmd`, so it
-does not block other one-shot clients. Output from other clients remains visible
-in attach, and attach input remains visible to `tail` and later `cmd` responses.
+`attach` is a polling console built on the same RPC protocol. It reads records
+by `sinceSeq` and sends each entered line through the same stdin queue as `cmd`,
+so it does not block other one-shot clients. Output from other clients remains
+visible in attach, and attach input remains visible to `tail` and later `cmd`
+responses.
 
 This is not a true PTY or ConPTY. It is intended for line-oriented consoles such
 as Minecraft server stdin, REPLs, and long-running service consoles. Full-screen
@@ -302,9 +339,10 @@ Run the standard-library test suite:
 python3 -m unittest discover -s tests -v
 ```
 
-The tests cover daemon singleton behavior, command/tail flow, concurrent client
-commands, attach with piped input, offset-based reads, bounded large-output
-handling with log rotation, command failure after child process exit, a
+The tests cover daemon singleton behavior, command/tail flow, stdout/stderr
+split records with global sequence order, concurrent client commands, attach
+with piped input, seq-based reads, bounded large-output handling with log
+rotation, command failure after child process exit, a
 non-reading child process that would otherwise block stdin writes, slow large
 stdin writes with explicit `--input-wait`, response byte limit rejection,
 profiles, and on-failure restarts.

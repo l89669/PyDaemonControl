@@ -22,8 +22,11 @@ a distributed process manager.
 - Never keep unbounded process output in memory.
 - Large output must go to rolling log files. Client responses must be explicitly
   size-limited.
-- Preserve the model where `cmd` returns output generated after its stdin write,
-  while allowing unrelated interleaved output.
+- Preserve the model where `cmd` returns records generated after its stdin
+  write, while allowing unrelated interleaved output.
+- Keep output records split by stream (`stdout`, `stderr`, `system`, `stdin`)
+  with one process-wide monotonic `seq`. Do not reintroduce a daemon-owned
+  combined output body or byte-offset read protocol.
 - Never let a child process that stops reading stdin pin a daemon request thread
   indefinitely. Keep stdin writes behind bounded queues or bounded waits.
 - Keep operation timeouts phase-specific: RPC/startup overhead, stdin write
@@ -32,6 +35,9 @@ a distributed process manager.
 - Keep profiles and restart policies generic. They should make Minecraft servers
   comfortable to manage without adding Minecraft-specific lifecycle semantics to
   the core process controller.
+- Keep `restart` a lifecycle operation for an existing daemon-managed process.
+  It must reuse the current in-memory process spec and must not accept argv/cwd
+  or profile changes.
 
 ## Editing Guidance
 

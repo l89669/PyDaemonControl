@@ -40,6 +40,12 @@ class PyDaemonControlTest(unittest.TestCase):
         proc = self.run_ctl(*args, timeout=timeout)
         return json.loads(proc.stdout)
 
+    def combined(self, response: dict) -> str:
+        return pdc.render_records_combined(response)
+
+    def stream_text(self, response: dict, stream: str) -> str:
+        return "".join(str(item[1]) for item in response.get(stream, []))
+
     def start_echo_process(self) -> None:
         code = (
             "import sys\n"
@@ -57,6 +63,72 @@ class PyDaemonControlTest(unittest.TestCase):
         first = self.run_json("daemon-start")
         second = self.run_json("daemon-start")
         self.assertEqual(first["pid"], second["pid"])
+
+    def test_start_replacement_closes_old_log_handles(self) -> None:
+        daemon = pdc.ProcHostDaemon(self.root, max_log_bytes=1024 * 1024, rotate_count=1)
+        old_entry = pdc.HostedProcess(
+            name="svc",
+            argv=[sys.executable, "-c", "pass"],
+            cwd=self.root,
+            log_path=daemon.paths["logs"] / "svc.log",
+            supervisor=daemon.platform.processes,
+        )
+        old_entry.write_event("system", "old entry")
+        self.assertTrue(old_entry._fds)
+        daemon.processes["svc"] = old_entry
+
+        original_start = pdc.HostedProcess.start
+
+        def fake_start(entry: pdc.HostedProcess, restarted: bool = False) -> None:
+            entry.write_event("system", "new entry")
+
+        try:
+            pdc.HostedProcess.start = fake_start
+            daemon._start(
+                {
+                    "name": "svc",
+                    "cwd": str(self.root),
+                    "argv": [sys.executable, "-c", "pass"],
+                    "maxLogBytes": 1024 * 1024,
+                    "rotateCount": 1,
+                }
+            )
+        finally:
+            pdc.HostedProcess.start = original_start
+            daemon.processes["svc"].close_log()
+
+        self.assertTrue(old_entry._logs_closed)
+        self.assertFalse(old_entry._fds)
+
+    def test_failed_start_closes_new_log_handles(self) -> None:
+        daemon = pdc.ProcHostDaemon(self.root, max_log_bytes=1024 * 1024, rotate_count=1)
+        created: list[pdc.HostedProcess] = []
+        original_start = pdc.HostedProcess.start
+
+        def fake_start(entry: pdc.HostedProcess, restarted: bool = False) -> None:
+            created.append(entry)
+            entry.write_event("system", "about to fail")
+            raise RuntimeError("boom")
+
+        try:
+            pdc.HostedProcess.start = fake_start
+            with self.assertRaises(RuntimeError):
+                daemon._start(
+                    {
+                        "name": "svc",
+                        "cwd": str(self.root),
+                        "argv": [sys.executable, "-c", "pass"],
+                        "maxLogBytes": 1024 * 1024,
+                        "rotateCount": 1,
+                    }
+                )
+        finally:
+            pdc.HostedProcess.start = original_start
+
+        self.assertNotIn("svc", daemon.processes)
+        self.assertEqual(1, len(created))
+        self.assertTrue(created[0]._logs_closed)
+        self.assertFalse(created[0]._fds)
 
     def test_profile_set_show_start_and_remove(self) -> None:
         code = (
@@ -85,10 +157,89 @@ class PyDaemonControlTest(unittest.TestCase):
 
         self.run_json("start", "profiled")
         response = self.run_json("cmd", "profiled", "ok", "--wait", "1", "--bytes", "4096")
-        self.assertIn("PROFILE:ok", response["output"])
+        self.assertIn("PROFILE:ok", self.stream_text(response, "stdout"))
 
         removed = self.run_json("profile", "remove", "profiled")
         self.assertTrue(removed["removed"])
+
+    def test_restart_rejects_new_argv_and_keeps_process_running(self) -> None:
+        self.start_echo_process()
+        proc = self.run_ctl(
+            "restart",
+            "echo",
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(9)",
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("unrecognized arguments", proc.stderr)
+
+        response = self.run_json("cmd", "echo", "still-here", "--wait", "1", "--bytes", "4096")
+        self.assertIn("ECHO:still-here", self.stream_text(response, "stdout"))
+
+    def test_restart_rpc_ignores_spec_fields(self) -> None:
+        daemon = pdc.ProcHostDaemon(self.root, max_log_bytes=1024 * 1024, rotate_count=1)
+        original_argv = [sys.executable, "-c", "print('original')"]
+        entry = pdc.HostedProcess(
+            name="svc",
+            argv=original_argv,
+            cwd=self.root,
+            log_path=daemon.paths["logs"] / "svc.log",
+            supervisor=daemon.platform.processes,
+        )
+        daemon.processes["svc"] = entry
+        started_argvs: list[list[str]] = []
+        original_start = pdc.HostedProcess.start
+
+        def fake_start(process: pdc.HostedProcess, restarted: bool = False) -> None:
+            started_argvs.append(list(process.argv))
+            process.write_event("system", "fake restart")
+
+        try:
+            pdc.HostedProcess.start = fake_start
+            response = daemon.handle(
+                {
+                    "action": "restart",
+                    "name": "svc",
+                    "argv": ["definitely-not-the-command"],
+                    "cwd": str(self.root / "wrong"),
+                    "restart": {"mode": "always"},
+                    "maxLogBytes": 1,
+                    "rotateCount": 0,
+                    "grace": 0,
+                }
+            )
+        finally:
+            pdc.HostedProcess.start = original_start
+            entry.close_log()
+
+        self.assertTrue(response["restarted"])
+        self.assertEqual([original_argv], started_argvs)
+        self.assertEqual(original_argv, response["status"]["argv"])
+
+    def test_restart_uses_existing_process_spec(self) -> None:
+        code = (
+            "import pathlib, sys\n"
+            "path = pathlib.Path('restart-count.txt')\n"
+            "count = int(path.read_text()) if path.exists() else 0\n"
+            "count += 1\n"
+            "path.write_text(str(count))\n"
+            "print('START:%d' % count, flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('ECHO%d:%s' % (count, line.strip()), flush=True)\n"
+        )
+        self.run_ctl("start", "reuser", "--", sys.executable, "-u", "-c", code)
+        first = self.run_json("cmd", "reuser", "one", "--wait", "1", "--bytes", "4096")
+        self.assertIn("ECHO1:one", self.stream_text(first, "stdout"))
+
+        restarted = self.run_json("restart", "reuser", "--grace", "0.2", timeout=5)
+        self.assertTrue(restarted["restarted"])
+        second = self.run_json("cmd", "reuser", "two", "--wait", "1", "--bytes", "4096")
+        self.assertIn("ECHO2:two", self.stream_text(second, "stdout"))
+        self.assertEqual("2", (self.root / "restart-count.txt").read_text())
 
     def test_on_failure_restart_policy_restarts_process(self) -> None:
         code = (
@@ -133,7 +284,7 @@ class PyDaemonControlTest(unittest.TestCase):
             self.fail(f"process did not restart: {status}")
 
         response = self.run_json("cmd", "flaky", "ok", "--wait", "1", "--bytes", "4096")
-        self.assertIn("AFTER_RESTART:ok", response["output"])
+        self.assertIn("AFTER_RESTART:ok", self.stream_text(response, "stdout"))
         self.assertEqual("2", (self.root / "attempt.txt").read_text())
 
     def test_stop_suppress_restart_blocks_always_restart_once(self) -> None:
@@ -220,7 +371,7 @@ class PyDaemonControlTest(unittest.TestCase):
             "4096",
         )
         self.assertTrue(response["suppressRestartRequested"])
-        self.assertIn("EXITING", response["output"])
+        self.assertIn("EXITING", self.stream_text(response, "stdout"))
         time.sleep(0.6)
         status = self.run_json("status")
         proc_status = status["processes"]["commanded"]
@@ -231,34 +382,90 @@ class PyDaemonControlTest(unittest.TestCase):
     def test_cmd_tail_and_clean_exit(self) -> None:
         self.start_echo_process()
         response = self.run_json("cmd", "echo", "hello", "--wait", "1", "--bytes", "4096")
-        self.assertIn("ECHO:hello", response["output"])
+        self.assertIn("ECHO:hello", self.stream_text(response, "stdout"))
 
-        tail = self.run_ctl("tail", "echo", "--bytes", "4096").stdout
-        self.assertIn("READY", tail)
-        self.assertIn("ECHO:hello", tail)
+        tail = self.run_json("tail", "echo", "--bytes", "4096")
+        self.assertIn("READY", self.stream_text(tail, "stdout"))
+        self.assertIn("ECHO:hello", self.stream_text(tail, "stdout"))
 
         response = self.run_json("cmd", "echo", "exit", "--wait", "1", "--bytes", "4096")
-        self.assertIn("BYE", response["output"])
+        self.assertIn("BYE", self.stream_text(response, "stdout"))
 
-    def test_read_action_advances_offset_without_repeating(self) -> None:
+    def test_stdout_stderr_are_split_with_global_seq(self) -> None:
+        code = (
+            "import sys, time\n"
+            "print('OUT1', flush=True)\n"
+            "time.sleep(0.1)\n"
+            "print('ERR1', file=sys.stderr, flush=True)\n"
+            "time.sleep(0.1)\n"
+            "print('OUT2', flush=True)\n"
+            "time.sleep(1)\n"
+        )
+        self.run_ctl("start", "mixed", "--", sys.executable, "-u", "-c", code)
+        time.sleep(0.5)
+
+        tail = self.run_json("tail", "mixed", "--bytes", "4096")
+        stdout = self.stream_text(tail, "stdout")
+        stderr = self.stream_text(tail, "stderr")
+        self.assertIn("OUT1", stdout)
+        self.assertIn("OUT2", stdout)
+        self.assertIn("ERR1", stderr)
+        self.assertNotIn("ERR1", stdout)
+        self.assertNotIn("OUT1", stderr)
+
+        records = pdc.iter_wire_records(tail)
+        seqs = [record.seq for record in records]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(seqs), len(set(seqs)))
+        combined = pdc.render_records_combined(tail)
+        self.assertLess(combined.index("OUT1"), combined.index("ERR1"))
+        self.assertLess(combined.index("ERR1"), combined.index("OUT2"))
+
+    def test_read_from_ignores_replaced_log_file_after_rotation(self) -> None:
+        entry = pdc.HostedProcess(
+            name="rot",
+            argv=[sys.executable, "-c", "pass"],
+            cwd=self.root,
+            log_path=self.root / ".pydaemoncontrol" / "logs" / "rot.log",
+            supervisor=pdc.PlatformServices(pdc.state_paths(self.root)).processes,
+            max_log_bytes=80,
+            rotate_count=1,
+        )
+        try:
+            entry.write_records("stdout", ["A" * 120])
+            since_seq = entry.next_seq
+            entry.write_records("stdout", ["EXPECTED\n"])
+            entry._stream_log_path("stdout").write_text(
+                json.dumps([9999, "WRONG\n"]) + "\n",
+                encoding="utf-8",
+            )
+
+            response = entry.read_from(since_seq, 4096)
+        finally:
+            entry.close_log()
+
+        self.assertIn("EXPECTED", self.stream_text(response, "stdout"))
+        self.assertNotIn("WRONG", self.stream_text(response, "stdout"))
+
+    def test_read_action_advances_seq_without_repeating(self) -> None:
         self.start_echo_process()
         client = pdc.ProcHostClient(self.root, SCRIPT, timeout=2)
         status = client.request({"action": "status"})
-        offset = status["processes"]["echo"]["bytesWritten"]
+        since_seq = status["processes"]["echo"]["nextSeq"]
 
         self.run_json("cmd", "echo", "first", "--wait", "1", "--bytes", "4096")
-        first = client.request({"action": "read", "name": "echo", "offset": offset, "maxBytes": 4096})
-        self.assertIn("ECHO:first", first["output"])
-        self.assertGreater(first["nextOffset"], offset)
+        first = client.request({"action": "read", "name": "echo", "sinceSeq": since_seq, "maxBytes": 4096})
+        self.assertIn("ECHO:first", self.stream_text(first, "stdout"))
+        self.assertGreater(first["nextSeq"], since_seq)
 
-        empty = client.request({"action": "read", "name": "echo", "offset": first["nextOffset"], "maxBytes": 4096})
-        self.assertEqual("", empty["output"])
-        self.assertEqual(first["nextOffset"], empty["nextOffset"])
+        empty = client.request({"action": "read", "name": "echo", "sinceSeq": first["nextSeq"], "maxBytes": 4096})
+        self.assertEqual("", self.combined(empty))
+        self.assertEqual(first["nextSeq"], empty["nextSeq"])
 
         self.run_json("cmd", "echo", "second", "--wait", "1", "--bytes", "4096")
-        second = client.request({"action": "read", "name": "echo", "offset": empty["nextOffset"], "maxBytes": 4096})
-        self.assertNotIn("ECHO:first", second["output"])
-        self.assertIn("ECHO:second", second["output"])
+        second = client.request({"action": "read", "name": "echo", "sinceSeq": empty["nextSeq"], "maxBytes": 4096})
+        self.assertNotIn("ECHO:first", self.stream_text(second, "stdout"))
+        self.assertIn("ECHO:second", self.stream_text(second, "stdout"))
 
     def test_attach_accepts_piped_input_and_detaches_on_eof(self) -> None:
         self.start_echo_process()
@@ -293,7 +500,7 @@ class PyDaemonControlTest(unittest.TestCase):
 
         def send(index: int) -> str:
             token = f"msg-{index:02d}"
-            return self.run_json("cmd", "echo", token, "--wait", "1", "--bytes", "4096")["output"]
+            return self.stream_text(self.run_json("cmd", "echo", token, "--wait", "1", "--bytes", "4096"), "stdout")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             outputs = list(pool.map(send, range(16)))
@@ -317,10 +524,10 @@ class PyDaemonControlTest(unittest.TestCase):
         )
         time.sleep(1.0)
 
-        tail = self.run_ctl("tail", "spam", "--bytes", "100").stdout
-        self.assertLessEqual(len(tail.encode("utf-8")), 512)
+        tail = self.run_json("tail", "spam", "--bytes", "100")
+        self.assertLessEqual(pdc.record_text_bytes(pdc.iter_wire_records(tail)), 100)
         log_dir = self.root / ".pydaemoncontrol" / "logs"
-        self.assertTrue((log_dir / "spam.log.1").exists())
+        self.assertTrue((log_dir / "spam.stdout.log.1").exists())
 
     def test_cmd_after_process_exit_fails_without_hanging(self) -> None:
         self.run_ctl("start", "quick", "--", sys.executable, "-c", "print('done')")
@@ -383,7 +590,7 @@ class PyDaemonControlTest(unittest.TestCase):
 
         self.assertTrue(response["written"])
         self.assertFalse(response["inputWaitExpired"])
-        self.assertIn(f"READ:{size}", response["output"])
+        self.assertIn(f"READ:{size}", self.stream_text(response, "stdout"))
 
     def test_output_byte_limit_is_rejected_before_daemon_response_grows(self) -> None:
         self.start_echo_process()
