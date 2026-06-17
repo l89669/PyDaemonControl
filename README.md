@@ -54,6 +54,12 @@ Send one line to the process stdin and return output produced after the input:
 pydaemoncontrol --root /srv/example cmd app 'status' --wait 1 --bytes 12000
 ```
 
+If stdin writing itself may be slow, give that phase its own budget:
+
+```bash
+pydaemoncontrol --root /srv/example cmd app 'status' --input-wait 2 --wait 1 --bytes 12000
+```
+
 Read recent output without sending input:
 
 ```bash
@@ -140,6 +146,24 @@ child process stops reading stdin. In that case the response returns
 `written: false`, and later `status`, `tail`, or `stop` requests can still be
 served.
 
+Large stdin values are truncated in the log, so a command response is not filled
+with the input text before the child process output can be captured.
+
+## Timeout Model
+
+Timeouts are split by operation phase:
+
+- `--timeout`: client RPC overhead and daemon startup budget.
+- `--input-wait`: maximum time `send`/`cmd` waits for stdin write confirmation.
+- `--wait`: maximum time after confirmed input to collect new output.
+- `--quiet`: early-return quiet window after output has started.
+- `--grace`: graceful stop budget before force kill.
+
+For `send`/`cmd`, the client request timeout is `--timeout + --input-wait +
+--wait`. For `stop`, `restart`, and `daemon-stop`, it is `--timeout + --grace`.
+The daemon also caps request and response bodies at `8 MiB`, and `--bytes` is
+limited to `4 MiB` per response.
+
 ## Requirements
 
 - Linux/POSIX or Windows
@@ -166,5 +190,6 @@ python3 -m unittest discover -s tests -v
 
 The tests cover daemon singleton behavior, command/tail flow, concurrent client
 commands, bounded large-output handling with log rotation, command failure after
-child process exit, and a non-reading child process that would otherwise block
-stdin writes.
+child process exit, a non-reading child process that would otherwise block stdin
+writes, slow large stdin writes with explicit `--input-wait`, and response byte
+limit rejection.

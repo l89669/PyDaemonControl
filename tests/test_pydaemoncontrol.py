@@ -122,7 +122,8 @@ class PyDaemonControlTest(unittest.TestCase):
                 "action": "send",
                 "name": "blocked",
                 "text": "X" * (2 * 1024 * 1024),
-                "appendNewline": False,
+                "newline": False,
+                "inputWait": 0.1,
                 "wait": 0,
                 "maxBytes": 1024,
             },
@@ -132,8 +133,52 @@ class PyDaemonControlTest(unittest.TestCase):
 
         self.assertLess(elapsed, 1.5)
         self.assertFalse(response["written"])
+        self.assertTrue(response["inputWaitExpired"])
         status = client.request({"action": "status"}, timeout=2)
         self.assertIn("blocked", status["processes"])
+
+    def test_input_wait_allows_slow_large_stdin_write_to_be_captured(self) -> None:
+        size = 2 * 1024 * 1024
+        code = (
+            "import sys, time\n"
+            "print('READY', flush=True)\n"
+            "time.sleep(0.5)\n"
+            f"data = sys.stdin.buffer.read({size})\n"
+            "print('READ:%d' % len(data), flush=True)\n"
+        )
+        self.run_ctl("start", "slowread", "--", sys.executable, "-u", "-c", code)
+        client = pdc.ProcHostClient(self.root, SCRIPT, timeout=2)
+
+        response = client.request(
+            {
+                "action": "send",
+                "name": "slowread",
+                "text": "X" * size,
+                "newline": False,
+                "inputWait": 3,
+                "wait": 2,
+                "quiet": 0.1,
+                "maxBytes": 8192,
+            },
+            timeout=7,
+        )
+
+        self.assertTrue(response["written"])
+        self.assertFalse(response["inputWaitExpired"])
+        self.assertIn(f"READ:{size}", response["output"])
+
+    def test_output_byte_limit_is_rejected_before_daemon_response_grows(self) -> None:
+        self.start_echo_process()
+        proc = self.run_ctl(
+            "tail",
+            "echo",
+            "--bytes",
+            str(pdc.MAX_OUTPUT_BYTES + 1),
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("maxBytes must be at most", proc.stderr)
 
 
 if __name__ == "__main__":

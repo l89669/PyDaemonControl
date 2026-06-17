@@ -26,6 +26,9 @@ a distributed process manager.
   while allowing unrelated interleaved output.
 - Never let a child process that stops reading stdin pin a daemon request thread
   indefinitely. Keep stdin writes behind bounded queues or bounded waits.
+- Keep operation timeouts phase-specific: RPC/startup overhead, stdin write
+  confirmation, post-input output capture, output quiet window, and stop grace
+  are separate knobs with separate tests.
 
 ## Editing Guidance
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import signal
@@ -38,8 +39,19 @@ DEFAULT_MAX_LOG_BYTES = 32 * 1024 * 1024
 DEFAULT_ROTATE_COUNT = 3
 DEFAULT_TAIL_CHARS = 256 * 1024
 REQUEST_LIMIT_BYTES = 8 * 1024 * 1024
+RESPONSE_LIMIT_BYTES = 8 * 1024 * 1024
+MAX_OUTPUT_BYTES = RESPONSE_LIMIT_BYTES // 2
 STDIN_QUEUE_LIMIT = 128
-STDIN_WRITE_ACK_TIMEOUT = 0.25
+MAX_STDIN_LOG_CHARS = 4096
+DEFAULT_CLIENT_TIMEOUT = 10.0
+DEFAULT_DAEMON_CONN_TIMEOUT = 30.0
+DEFAULT_DAEMON_ACCEPT_TIMEOUT = 0.5
+DEFAULT_INPUT_WAIT = 0.25
+DEFAULT_OUTPUT_WAIT = 1.0
+DEFAULT_OUTPUT_QUIET = 0.2
+DEFAULT_STOP_GRACE = 5.0
+DEFAULT_FORCE_KILL_WAIT = 5.0
+DEFAULT_START_POLL_INTERVAL = 0.1
 IS_WINDOWS = os.name == "nt"
 
 
@@ -58,6 +70,46 @@ def sanitize_name(name: str) -> str:
     if any(ch not in allowed for ch in name):
         raise RpcError("process name may only contain letters, digits, dot, dash and underscore")
     return name
+
+
+def require_seconds(value: Any, name: str, *, positive: bool) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise RpcError(f"{name} must be a number of seconds") from exc
+    if not math.isfinite(seconds):
+        raise RpcError(f"{name} must be finite")
+    if positive and seconds <= 0:
+        raise RpcError(f"{name} must be greater than 0")
+    if not positive and seconds < 0:
+        raise RpcError(f"{name} must be greater than or equal to 0")
+    return seconds
+
+
+def require_int_at_least(value: Any, name: str, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RpcError(f"{name} must be an integer") from exc
+    if parsed < minimum:
+        raise RpcError(f"{name} must be at least {minimum}")
+    return parsed
+
+
+def require_output_bytes(value: Any) -> int:
+    parsed = require_int_at_least(value, "maxBytes", 1)
+    if parsed > MAX_OUTPUT_BYTES:
+        raise RpcError(f"maxBytes must be at most {MAX_OUTPUT_BYTES}")
+    return parsed
+
+
+def format_stdin_log(text: str) -> str:
+    if len(text) <= MAX_STDIN_LOG_CHARS:
+        return text
+    return (
+        text[:MAX_STDIN_LOG_CHARS]
+        + f"\n[pydaemoncontrol] stdin log truncated; originalChars={len(text)}"
+    )
 
 
 def state_paths(root: Path) -> dict[str, Path]:
@@ -85,6 +137,21 @@ def decode_request(raw: bytes) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RpcError("request must be a json object")
     return data
+
+
+def read_socket_message(sock: socket.socket, limit: int, label: str) -> bytes:
+    raw = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+            if len(raw) > limit:
+                raise RpcError(f"{label} too large")
+    except socket.timeout as exc:
+        raise RpcError(f"{label} timed out") from exc
+    return raw
 
 
 def write_daemon_log(paths: dict[str, Path], message: str) -> None:
@@ -285,7 +352,7 @@ class PosixProcessSupervisor(ProcessSupervisor):
                 os.killpg(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            proc.wait(timeout=3)
+            proc.wait(timeout=DEFAULT_FORCE_KILL_WAIT)
 
 
 class WindowsProcessSupervisor(ProcessSupervisor):
@@ -314,13 +381,13 @@ class WindowsProcessSupervisor(ProcessSupervisor):
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    timeout=5,
+                    timeout=DEFAULT_FORCE_KILL_WAIT,
                     check=False,
                 )
             except Exception as exc:
                 write_event("system", f"taskkill failed: {exc}")
                 proc.kill()
-            proc.wait(timeout=5)
+            proc.wait(timeout=DEFAULT_FORCE_KILL_WAIT)
 
 
 class PlatformServices:
@@ -502,19 +569,19 @@ class HostedProcess:
     def write_chunk(self, stream_name: str, chunk: bytes) -> None:
         prefix = f"[{now_stamp()} {stream_name}] ".encode("utf-8")
         chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-        data = bytearray()
-        if not self._line_open.get(stream_name, False):
-            data.extend(prefix)
-        parts = chunk.split(b"\n")
-        for index, part in enumerate(parts):
-            if index > 0:
-                data.extend(b"\n")
-                if part:
-                    data.extend(prefix)
-            data.extend(part)
-        self._line_open[stream_name] = not chunk.endswith(b"\n")
-        data_bytes = bytes(data)
         with self._cond:
+            data = bytearray()
+            if not self._line_open.get(stream_name, False):
+                data.extend(prefix)
+            parts = chunk.split(b"\n")
+            for index, part in enumerate(parts):
+                if index > 0:
+                    data.extend(b"\n")
+                    if part:
+                        data.extend(prefix)
+                data.extend(part)
+            self._line_open[stream_name] = not chunk.endswith(b"\n")
+            data_bytes = bytes(data)
             self._rotate_if_needed(len(data_bytes))
             if self._fd is None:
                 self._fd = os.open(self.log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
@@ -548,7 +615,7 @@ class HostedProcess:
             return ""
         return raw.decode("utf-8", errors="replace")
 
-    def wait_for_output_after(self, offset: int, timeout: float, quiet: float = 0.2) -> None:
+    def wait_for_output_after(self, offset: int, timeout: float, quiet: float = DEFAULT_OUTPUT_QUIET) -> None:
         end = time.time() + max(0.0, timeout)
         seen = False
         last_written = offset
@@ -565,11 +632,19 @@ class HostedProcess:
                 if seen:
                     break
 
-    def send(self, text: str, append_newline: bool, wait: float, max_bytes: int) -> dict[str, Any]:
+    def send(
+        self,
+        text: str,
+        append_newline: bool,
+        input_wait: float,
+        wait: float,
+        quiet: float,
+        max_bytes: int,
+    ) -> dict[str, Any]:
         if not self.running or self.proc is None or self.proc.stdin is None:
             raise RpcError(f"{self.name} is not running")
         payload = text + ("\n" if append_newline else "")
-        job = StdinJob(payload=payload.encode("utf-8"), display_text=payload.rstrip("\n"))
+        job = StdinJob(payload=payload.encode("utf-8"), display_text=format_stdin_log(payload.rstrip("\n")))
         with self._lock:
             offset = self.bytes_written
         try:
@@ -577,13 +652,25 @@ class HostedProcess:
         except queue.Full as exc:
             raise RpcError(f"{self.name} stdin queue is full") from exc
 
-        if not job.done.wait(STDIN_WRITE_ACK_TIMEOUT):
-            return {"offset": offset, "queued": True, "written": False, "output": self.read_since(offset, max_bytes)}
+        if not job.done.wait(max(0.0, input_wait)):
+            return {
+                "offset": offset,
+                "queued": True,
+                "written": False,
+                "inputWaitExpired": True,
+                "output": self.read_since(offset, max_bytes),
+            }
         if job.error is not None:
             raise RpcError(job.error)
         if wait > 0:
-            self.wait_for_output_after(offset, wait)
-        return {"offset": offset, "queued": True, "written": job.written, "output": self.read_since(offset, max_bytes)}
+            self.wait_for_output_after(offset, wait, quiet)
+        return {
+            "offset": offset,
+            "queued": True,
+            "written": job.written,
+            "inputWaitExpired": False,
+            "output": self.read_since(offset, max_bytes),
+        }
 
     def stop(self, grace: float) -> dict[str, Any]:
         if not self.running or self.proc is None:
@@ -614,7 +701,7 @@ class ProcHostDaemon:
         try:
             server = self.platform.endpoint.bind_server()
             server.listen(16)
-            server.settimeout(0.5)
+            server.settimeout(DEFAULT_DAEMON_ACCEPT_TIMEOUT)
             write_daemon_log(self.paths, f"daemon started pid={os.getpid()} root={self.root}")
             while not self._shutdown.is_set():
                 try:
@@ -635,20 +722,17 @@ class ProcHostDaemon:
     def _handle_conn(self, conn: socket.socket) -> None:
         with conn:
             try:
-                raw = b""
-                while True:
-                    chunk = conn.recv(65536)
-                    if not chunk:
-                        break
-                    raw += chunk
-                    if len(raw) > REQUEST_LIMIT_BYTES:
-                        raise RpcError("request too large")
+                conn.settimeout(DEFAULT_DAEMON_CONN_TIMEOUT)
+                raw = read_socket_message(conn, REQUEST_LIMIT_BYTES, "request")
                 req = decode_request(raw)
                 self.platform.endpoint.validate_server_request(req)
                 response = {"ok": True, "data": self.handle(req)}
             except Exception as exc:
                 response = {"ok": False, "error": str(exc)}
-            conn.sendall(encode_response(response))
+            encoded = encode_response(response)
+            if len(encoded) > RESPONSE_LIMIT_BYTES:
+                encoded = encode_response({"ok": False, "error": "response too large"})
+            conn.sendall(encoded)
 
     def get_process(self, name: str) -> HostedProcess:
         name = sanitize_name(name)
@@ -672,26 +756,32 @@ class ProcHostDaemon:
         if action == "restart":
             name = sanitize_name(str(req.get("name", "")))
             if name in self.processes:
-                self.processes[name].stop(float(req.get("grace", 5.0)))
+                self.processes[name].stop(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
             return self._start(req, replace=True)
         if action == "send":
             entry = self.get_process(str(req.get("name", "")))
             return entry.send(
                 str(req.get("text", "")),
-                bool(req.get("newline", True)),
-                float(req.get("wait", 1.0)),
-                int(req.get("maxBytes", 65536)),
+                bool(req.get("newline", req.get("appendNewline", True))),
+                require_seconds(req.get("inputWait", DEFAULT_INPUT_WAIT), "inputWait", positive=False),
+                require_seconds(req.get("wait", DEFAULT_OUTPUT_WAIT), "wait", positive=False),
+                require_seconds(req.get("quiet", DEFAULT_OUTPUT_QUIET), "quiet", positive=False),
+                require_output_bytes(req.get("maxBytes", 65536)),
             )
         if action == "tail":
             entry = self.get_process(str(req.get("name", "")))
-            return {"output": entry.read_tail(int(req.get("maxBytes", 65536))), "status": entry.status()}
+            return {
+                "output": entry.read_tail(require_output_bytes(req.get("maxBytes", 65536))),
+                "status": entry.status(),
+            }
         if action == "stop":
             entry = self.get_process(str(req.get("name", "")))
-            return entry.stop(float(req.get("grace", 5.0)))
+            return entry.stop(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
         if action == "daemon-stop":
             if req.get("stopChildren", False):
+                grace = require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False)
                 for entry in list(self.processes.values()):
-                    entry.stop(float(req.get("grace", 5.0)))
+                    entry.stop(grace)
             self._shutdown.set()
             return {"stopping": True, "daemonPid": os.getpid()}
         raise RpcError(f"unknown action: {action}")
@@ -712,8 +802,8 @@ class ProcHostDaemon:
             cwd=cwd,
             log_path=log_path,
             supervisor=self.platform.processes,
-            max_log_bytes=int(req.get("maxLogBytes", self.max_log_bytes)),
-            rotate_count=int(req.get("rotateCount", self.rotate_count)),
+            max_log_bytes=require_int_at_least(req.get("maxLogBytes", self.max_log_bytes), "maxLogBytes", 0),
+            rotate_count=require_int_at_least(req.get("rotateCount", self.rotate_count), "rotateCount", 0),
         )
         self.processes[name] = entry
         entry.start()
@@ -726,7 +816,7 @@ class ProcHostClient:
         self.script = script.resolve()
         self.paths = state_paths(self.root)
         self.platform = PlatformServices(self.paths)
-        self.timeout = timeout
+        self.timeout = require_seconds(timeout, "timeout", positive=True)
 
     def daemon_running(self) -> bool:
         try:
@@ -765,20 +855,19 @@ class ProcHostClient:
                 return self.request({"action": "ping"}, timeout=0.5)
             except Exception as exc:
                 last_error = str(exc)
-                time.sleep(0.1)
+                time.sleep(DEFAULT_START_POLL_INTERVAL)
         raise RpcError(last_error)
 
     def request(self, payload: dict[str, Any], timeout: float | None = None) -> dict[str, Any]:
-        client = self.platform.endpoint.connect_client(self.timeout if timeout is None else timeout)
+        effective_timeout = self.timeout if timeout is None else require_seconds(timeout, "request timeout", positive=True)
+        client = self.platform.endpoint.connect_client(effective_timeout)
         try:
-            client.sendall(encode_response(self.platform.endpoint.prepare_client_request(payload)))
+            encoded = encode_response(self.platform.endpoint.prepare_client_request(payload))
+            if len(encoded) > REQUEST_LIMIT_BYTES:
+                raise RpcError("request too large")
+            client.sendall(encoded)
             client.shutdown(socket.SHUT_WR)
-            raw = b""
-            while True:
-                chunk = client.recv(65536)
-                if not chunk:
-                    break
-                raw += chunk
+            raw = read_socket_message(client, RESPONSE_LIMIT_BYTES, "response")
         finally:
             client.close()
         data = decode_request(raw)
@@ -797,7 +886,12 @@ def print_json(data: Any) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PyDaemonControl directory-scoped daemon/client")
     parser.add_argument("--root", default=".", help="Directory that owns exactly one daemon")
-    parser.add_argument("--timeout", type=float, default=10.0, help="Client/daemon-start timeout")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_CLIENT_TIMEOUT,
+        help="Client RPC and daemon-start overhead timeout",
+    )
     parser.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     parser.add_argument("--rotate-count", type=int, default=DEFAULT_ROTATE_COUNT)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -806,7 +900,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("daemon-start", help="Start daemon for the root directory")
     stop_daemon = sub.add_parser("daemon-stop", help="Stop daemon")
     stop_daemon.add_argument("--stop-children", action="store_true")
-    stop_daemon.add_argument("--grace", type=float, default=5.0)
+    stop_daemon.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
     sub.add_parser("status", help="Show daemon and process status")
 
     start = sub.add_parser("start", help="Start a named process")
@@ -819,7 +913,7 @@ def build_parser() -> argparse.ArgumentParser:
     restart = sub.add_parser("restart", help="Stop and start a named process")
     restart.add_argument("name")
     restart.add_argument("--cwd", default=None)
-    restart.add_argument("--grace", type=float, default=5.0)
+    restart.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
     restart.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
     restart.add_argument("--rotate-count", type=int, default=DEFAULT_ROTATE_COUNT)
     restart.add_argument("argv", nargs=argparse.REMAINDER)
@@ -828,14 +922,18 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("name")
     send.add_argument("text")
     send.add_argument("--no-newline", action="store_true")
-    send.add_argument("--wait", type=float, default=1.0)
+    send.add_argument("--input-wait", type=float, default=DEFAULT_INPUT_WAIT)
+    send.add_argument("--wait", type=float, default=DEFAULT_OUTPUT_WAIT)
+    send.add_argument("--quiet", type=float, default=DEFAULT_OUTPUT_QUIET)
     send.add_argument("--bytes", type=int, default=65536)
 
     cmd = sub.add_parser("cmd", help="Alias for send")
     cmd.add_argument("name")
     cmd.add_argument("text")
     cmd.add_argument("--no-newline", action="store_true")
-    cmd.add_argument("--wait", type=float, default=1.0)
+    cmd.add_argument("--input-wait", type=float, default=DEFAULT_INPUT_WAIT)
+    cmd.add_argument("--wait", type=float, default=DEFAULT_OUTPUT_WAIT)
+    cmd.add_argument("--quiet", type=float, default=DEFAULT_OUTPUT_QUIET)
     cmd.add_argument("--bytes", type=int, default=65536)
 
     tail = sub.add_parser("tail", help="Print recent process output")
@@ -844,7 +942,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stop = sub.add_parser("stop", help="Stop a named process")
     stop.add_argument("name")
-    stop.add_argument("--grace", type=float, default=5.0)
+    stop.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
     return parser
 
 
@@ -860,24 +958,28 @@ def main(argv: list[str] | None = None) -> int:
     script = Path(__file__).resolve()
 
     try:
+        max_log_bytes = require_int_at_least(args.max_log_bytes, "max-log-bytes", 0)
+        rotate_count = require_int_at_least(args.rotate_count, "rotate-count", 0)
         if args.cmd == "daemon-run":
-            return ProcHostDaemon(root, args.max_log_bytes, args.rotate_count).serve()
+            return ProcHostDaemon(root, max_log_bytes, rotate_count).serve()
 
         client = ProcHostClient(root, script, args.timeout)
         if args.cmd == "daemon-start":
-            print_json(client.start_daemon(args.max_log_bytes, args.rotate_count))
+            print_json(client.start_daemon(max_log_bytes, rotate_count))
             return 0
         if args.cmd == "status":
             print_json(client.request({"action": "status"}))
             return 0
         if args.cmd == "daemon-stop":
+            grace = require_seconds(args.grace, "grace", positive=False)
             print_json(
                 client.request(
                     {
                         "action": "daemon-stop",
                         "stopChildren": bool(args.stop_children),
-                        "grace": float(args.grace),
-                    }
+                        "grace": grace,
+                    },
+                    timeout=client.timeout + grace,
                 )
             )
             return 0
@@ -886,7 +988,8 @@ def main(argv: list[str] | None = None) -> int:
             if not proc_argv:
                 raise RpcError("missing process command after --")
             if not client.daemon_running():
-                client.start_daemon(args.max_log_bytes, args.rotate_count)
+                client.start_daemon(max_log_bytes, rotate_count)
+            grace = require_seconds(getattr(args, "grace", DEFAULT_STOP_GRACE), "grace", positive=False)
             print_json(
                 client.request(
                     {
@@ -894,14 +997,19 @@ def main(argv: list[str] | None = None) -> int:
                         "name": args.name,
                         "cwd": args.cwd,
                         "argv": proc_argv,
-                        "grace": getattr(args, "grace", 5.0),
-                        "maxLogBytes": args.max_log_bytes,
-                        "rotateCount": args.rotate_count,
-                    }
+                        "grace": grace,
+                        "maxLogBytes": max_log_bytes,
+                        "rotateCount": rotate_count,
+                    },
+                    timeout=client.timeout + (grace if args.cmd == "restart" else 0.0),
                 )
             )
             return 0
         if args.cmd in {"send", "cmd"}:
+            input_wait = require_seconds(args.input_wait, "input-wait", positive=False)
+            wait = require_seconds(args.wait, "wait", positive=False)
+            quiet = require_seconds(args.quiet, "quiet", positive=False)
+            max_bytes = require_output_bytes(args.bytes)
             print_json(
                 client.request(
                     {
@@ -909,19 +1017,28 @@ def main(argv: list[str] | None = None) -> int:
                         "name": args.name,
                         "text": args.text,
                         "newline": not args.no_newline,
-                        "wait": args.wait,
-                        "maxBytes": args.bytes,
+                        "inputWait": input_wait,
+                        "wait": wait,
+                        "quiet": quiet,
+                        "maxBytes": max_bytes,
                     },
-                    timeout=args.wait + args.timeout,
+                    timeout=client.timeout + input_wait + wait,
                 )
             )
             return 0
         if args.cmd == "tail":
-            data = client.request({"action": "tail", "name": args.name, "maxBytes": args.bytes})
+            max_bytes = require_output_bytes(args.bytes)
+            data = client.request({"action": "tail", "name": args.name, "maxBytes": max_bytes})
             sys.stdout.write(str(data.get("output", "")))
             return 0
         if args.cmd == "stop":
-            print_json(client.request({"action": "stop", "name": args.name, "grace": args.grace}))
+            grace = require_seconds(args.grace, "grace", positive=False)
+            print_json(
+                client.request(
+                    {"action": "stop", "name": args.name, "grace": grace},
+                    timeout=client.timeout + grace,
+                )
+            )
             return 0
         raise RpcError(f"unknown command: {args.cmd}")
     except Exception as exc:
