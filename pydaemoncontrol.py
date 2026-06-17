@@ -52,7 +52,11 @@ DEFAULT_OUTPUT_QUIET = 0.2
 DEFAULT_STOP_GRACE = 5.0
 DEFAULT_FORCE_KILL_WAIT = 5.0
 DEFAULT_START_POLL_INTERVAL = 0.1
+DEFAULT_ATTACH_HISTORY_BYTES = 20000
+DEFAULT_ATTACH_POLL = 0.2
+DEFAULT_ATTACH_DRAIN_ON_EOF = 1.0
 IS_WINDOWS = os.name == "nt"
+LOG_OPEN_FLAGS = os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
 
 
 class RpcError(Exception):
@@ -100,6 +104,13 @@ def require_output_bytes(value: Any) -> int:
     parsed = require_int_at_least(value, "maxBytes", 1)
     if parsed > MAX_OUTPUT_BYTES:
         raise RpcError(f"maxBytes must be at most {MAX_OUTPUT_BYTES}")
+    return parsed
+
+
+def require_history_bytes(value: Any) -> int:
+    parsed = require_int_at_least(value, "history", 0)
+    if parsed > MAX_OUTPUT_BYTES:
+        raise RpcError(f"history must be at most {MAX_OUTPUT_BYTES}")
     return parsed
 
 
@@ -409,6 +420,7 @@ class StdinJob:
     done: threading.Event = field(default_factory=threading.Event)
     written: bool = False
     error: str | None = None
+    log_end_offset: int | None = None
 
 
 @dataclass
@@ -440,7 +452,7 @@ class HostedProcess:
     def __post_init__(self) -> None:
         self._cond = threading.Condition(self._lock)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = os.open(self.log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        self._fd = os.open(self.log_path, LOG_OPEN_FLAGS, 0o644)
         self.bytes_written = self.log_path.stat().st_size if self.log_path.exists() else 0
 
     def close_log(self) -> None:
@@ -523,7 +535,7 @@ class HostedProcess:
                     continue
                 proc.stdin.write(job.payload)
                 proc.stdin.flush()
-                self.write_event("stdin", job.display_text)
+                job.log_end_offset = self.write_event("stdin", job.display_text)
                 job.written = True
             except Exception as exc:
                 job.error = f"stdin write failed: {exc}"
@@ -552,7 +564,7 @@ class HostedProcess:
                     dst.unlink()
                 src.rename(dst)
         self.current_base_offset = self.bytes_written
-        self._fd = os.open(self.log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        self._fd = os.open(self.log_path, LOG_OPEN_FLAGS, 0o644)
 
     def _add_tail(self, text: str) -> None:
         if not text:
@@ -563,10 +575,10 @@ class HostedProcess:
             removed = self._tail.popleft()
             self._tail_len -= len(removed)
 
-    def write_event(self, stream_name: str, text: str) -> None:
-        self.write_chunk(stream_name, (text.rstrip("\n") + "\n").encode("utf-8", errors="replace"))
+    def write_event(self, stream_name: str, text: str) -> int:
+        return self.write_chunk(stream_name, (text.rstrip("\n") + "\n").encode("utf-8", errors="replace"))
 
-    def write_chunk(self, stream_name: str, chunk: bytes) -> None:
+    def write_chunk(self, stream_name: str, chunk: bytes) -> int:
         prefix = f"[{now_stamp()} {stream_name}] ".encode("utf-8")
         chunk = chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         with self._cond:
@@ -584,11 +596,12 @@ class HostedProcess:
             data_bytes = bytes(data)
             self._rotate_if_needed(len(data_bytes))
             if self._fd is None:
-                self._fd = os.open(self.log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+                self._fd = os.open(self.log_path, LOG_OPEN_FLAGS, 0o644)
             os.write(self._fd, data_bytes)
             self.bytes_written += len(data_bytes)
             self._add_tail(data_bytes.decode("utf-8", errors="replace"))
             self._cond.notify_all()
+            return self.bytes_written
 
     def read_tail(self, max_bytes: int) -> str:
         max_bytes = max(1, max_bytes)
@@ -597,23 +610,53 @@ class HostedProcess:
         raw = joined.encode("utf-8", errors="replace")
         return raw[-max_bytes:].decode("utf-8", errors="replace")
 
-    def read_since(self, offset: int, max_bytes: int) -> str:
+    def read_from(self, offset: int, max_bytes: int) -> dict[str, Any]:
         max_bytes = max(1, max_bytes)
+        offset = max(0, offset)
         with self._lock:
             base = self.current_base_offset
             written = self.bytes_written
         if offset < base:
-            return "[pydaemoncontrol] requested offset was rotated; showing recent output\n" + self.read_tail(max_bytes)
+            return {
+                "output": "[pydaemoncontrol] requested offset was rotated; showing recent output\n"
+                + self.read_tail(max_bytes),
+                "offset": offset,
+                "nextOffset": written,
+                "rotated": True,
+                "status": self.status(),
+            }
         if offset >= written:
-            return ""
+            return {
+                "output": "",
+                "offset": offset,
+                "nextOffset": written,
+                "rotated": False,
+                "status": self.status(),
+            }
         local_offset = offset - base
+        read_len = min(max_bytes, written - offset)
         try:
             with self.log_path.open("rb") as fh:
                 fh.seek(local_offset)
-                raw = fh.read(max_bytes)
+                raw = fh.read(read_len)
         except FileNotFoundError:
-            return ""
-        return raw.decode("utf-8", errors="replace")
+            return {
+                "output": "",
+                "offset": offset,
+                "nextOffset": written,
+                "rotated": True,
+                "status": self.status(),
+            }
+        return {
+            "output": raw.decode("utf-8", errors="replace"),
+            "offset": offset,
+            "nextOffset": offset + len(raw),
+            "rotated": False,
+            "status": self.status(),
+        }
+
+    def read_since(self, offset: int, max_bytes: int) -> str:
+        return str(self.read_from(offset, max_bytes)["output"])
 
     def wait_for_output_after(self, offset: int, timeout: float, quiet: float = DEFAULT_OUTPUT_QUIET) -> None:
         end = time.time() + max(0.0, timeout)
@@ -663,7 +706,7 @@ class HostedProcess:
         if job.error is not None:
             raise RpcError(job.error)
         if wait > 0:
-            self.wait_for_output_after(offset, wait, quiet)
+            self.wait_for_output_after(job.log_end_offset if job.log_end_offset is not None else offset, wait, quiet)
         return {
             "offset": offset,
             "queued": True,
@@ -774,6 +817,12 @@ class ProcHostDaemon:
                 "output": entry.read_tail(require_output_bytes(req.get("maxBytes", 65536))),
                 "status": entry.status(),
             }
+        if action == "read":
+            entry = self.get_process(str(req.get("name", "")))
+            return entry.read_from(
+                require_int_at_least(req.get("offset", 0), "offset", 0),
+                require_output_bytes(req.get("maxBytes", 65536)),
+            )
         if action == "stop":
             entry = self.get_process(str(req.get("name", "")))
             return entry.stop(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
@@ -883,6 +932,93 @@ def print_json(data: Any) -> None:
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+def run_attach(
+    client: ProcHostClient,
+    name: str,
+    history: int,
+    poll: float,
+    read_bytes: int,
+    input_wait: float,
+    drain_on_eof: float,
+) -> int:
+    status = client.request({"action": "status"})
+    processes = status.get("processes", {})
+    if not isinstance(processes, dict) or name not in processes:
+        raise RpcError(f"unknown process: {name}")
+    proc_status = processes[name]
+    if not isinstance(proc_status, dict):
+        raise RpcError(f"invalid process status for {name}")
+
+    written = int(proc_status.get("bytesWritten", 0))
+    base = int(proc_status.get("currentBaseOffset", 0))
+    offset = written
+    if history > 0:
+        offset = max(base, written - history)
+        initial = client.request({"action": "read", "name": name, "offset": offset, "maxBytes": history})
+        sys.stdout.write(str(initial.get("output", "")))
+        sys.stdout.flush()
+        offset = int(initial.get("nextOffset", offset))
+
+    input_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_input() -> None:
+        try:
+            for line in sys.stdin:
+                input_queue.put(line.rstrip("\r\n"))
+        finally:
+            input_queue.put(None)
+
+    threading.Thread(target=read_input, daemon=True).start()
+    eof_deadline: float | None = None
+
+    while True:
+        while True:
+            try:
+                line = input_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                if eof_deadline is None:
+                    eof_deadline = time.time() + drain_on_eof
+                continue
+            response = client.request(
+                {
+                    "action": "send",
+                    "name": name,
+                    "text": line,
+                    "newline": True,
+                    "inputWait": input_wait,
+                    "wait": 0.0,
+                    "quiet": 0.0,
+                    "maxBytes": 1,
+                },
+                timeout=client.timeout + input_wait,
+            )
+            if not response.get("written", False):
+                print(
+                    f"[pydaemoncontrol] input queued; write not confirmed within {input_wait:.3f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        data = client.request({"action": "read", "name": name, "offset": offset, "maxBytes": read_bytes})
+        output = str(data.get("output", ""))
+        if output:
+            sys.stdout.write(output)
+            sys.stdout.flush()
+        offset = int(data.get("nextOffset", offset))
+        proc_status = data.get("status", {})
+        running = bool(proc_status.get("running", False)) if isinstance(proc_status, dict) else False
+
+        if eof_deadline is not None:
+            if time.time() >= eof_deadline:
+                return 0
+        elif not running:
+            return 0
+
+        time.sleep(poll)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="PyDaemonControl directory-scoped daemon/client")
     parser.add_argument("--root", default=".", help="Directory that owns exactly one daemon")
@@ -939,6 +1075,14 @@ def build_parser() -> argparse.ArgumentParser:
     tail = sub.add_parser("tail", help="Print recent process output")
     tail.add_argument("name")
     tail.add_argument("--bytes", type=int, default=65536)
+
+    attach = sub.add_parser("attach", help="Attach a polling console to a named process")
+    attach.add_argument("name")
+    attach.add_argument("--history", type=int, default=DEFAULT_ATTACH_HISTORY_BYTES)
+    attach.add_argument("--poll", type=float, default=DEFAULT_ATTACH_POLL)
+    attach.add_argument("--bytes", type=int, default=65536)
+    attach.add_argument("--input-wait", type=float, default=DEFAULT_INPUT_WAIT)
+    attach.add_argument("--drain-on-eof", type=float, default=DEFAULT_ATTACH_DRAIN_ON_EOF)
 
     stop = sub.add_parser("stop", help="Stop a named process")
     stop.add_argument("name")
@@ -1031,6 +1175,13 @@ def main(argv: list[str] | None = None) -> int:
             data = client.request({"action": "tail", "name": args.name, "maxBytes": max_bytes})
             sys.stdout.write(str(data.get("output", "")))
             return 0
+        if args.cmd == "attach":
+            history = require_history_bytes(args.history)
+            poll = require_seconds(args.poll, "poll", positive=True)
+            read_bytes = require_output_bytes(args.bytes)
+            input_wait = require_seconds(args.input_wait, "input-wait", positive=False)
+            drain_on_eof = require_seconds(args.drain_on_eof, "drain-on-eof", positive=False)
+            return run_attach(client, args.name, history, poll, read_bytes, input_wait, drain_on_eof)
         if args.cmd == "stop":
             grace = require_seconds(args.grace, "grace", positive=False)
             print_json(

@@ -66,6 +66,12 @@ Read recent output without sending input:
 pydaemoncontrol --root /srv/example tail app --bytes 20000
 ```
 
+Attach a polling console for human use:
+
+```bash
+pydaemoncontrol --root /srv/example attach app --history 20000 --poll 0.2
+```
+
 Show daemon and process status:
 
 ```bash
@@ -101,6 +107,12 @@ Run server console commands through the daemon:
 pydaemoncontrol --root /home/minecraft/server cmd mc 'list' --wait 1 --bytes 12000
 pydaemoncontrol --root /home/minecraft/server cmd mc 'say hello from pydaemoncontrol' --wait 1 --bytes 12000
 pydaemoncontrol --root /home/minecraft/server cmd mc 'stop' --wait 5 --bytes 20000
+```
+
+Or attach a human-facing console:
+
+```bash
+pydaemoncontrol --root /home/minecraft/server attach mc --history 40000 --poll 0.2
 ```
 
 ## State And Logs
@@ -149,6 +161,16 @@ served.
 Large stdin values are truncated in the log, so a command response is not filled
 with the input text before the child process output can be captured.
 
+`attach` is a polling console built on the same RPC protocol. It reads output by
+offset and sends each entered line through the same stdin queue as `cmd`, so it
+does not block other one-shot clients. Output from other clients remains visible
+in attach, and attach input remains visible to `tail` and later `cmd` responses.
+
+This is not a true PTY or ConPTY. It is intended for line-oriented consoles such
+as Minecraft server stdin, REPLs, and long-running service consoles. Full-screen
+interactive programs such as shells with readline, editors, or `top` need a real
+terminal backend and are outside this mode.
+
 ## Timeout Model
 
 Timeouts are split by operation phase:
@@ -158,6 +180,8 @@ Timeouts are split by operation phase:
 - `--wait`: maximum time after confirmed input to collect new output.
 - `--quiet`: early-return quiet window after output has started.
 - `--grace`: graceful stop budget before force kill.
+- `attach --poll`: interval between output reads.
+- `attach --drain-on-eof`: final output drain window after stdin EOF.
 
 For `send`/`cmd`, the client request timeout is `--timeout + --input-wait +
 --wait`. For `stop`, `restart`, and `daemon-stop`, it is `--timeout + --grace`.
@@ -189,7 +213,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests cover daemon singleton behavior, command/tail flow, concurrent client
-commands, bounded large-output handling with log rotation, command failure after
-child process exit, a non-reading child process that would otherwise block stdin
-writes, slow large stdin writes with explicit `--input-wait`, and response byte
-limit rejection.
+commands, attach with piped input, offset-based reads, bounded large-output
+handling with log rotation, command failure after child process exit, a
+non-reading child process that would otherwise block stdin writes, slow large
+stdin writes with explicit `--input-wait`, and response byte limit rejection.

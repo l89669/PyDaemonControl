@@ -70,6 +70,54 @@ class PyDaemonControlTest(unittest.TestCase):
         response = self.run_json("cmd", "echo", "exit", "--wait", "1", "--bytes", "4096")
         self.assertIn("BYE", response["output"])
 
+    def test_read_action_advances_offset_without_repeating(self) -> None:
+        self.start_echo_process()
+        client = pdc.ProcHostClient(self.root, SCRIPT, timeout=2)
+        status = client.request({"action": "status"})
+        offset = status["processes"]["echo"]["bytesWritten"]
+
+        self.run_json("cmd", "echo", "first", "--wait", "1", "--bytes", "4096")
+        first = client.request({"action": "read", "name": "echo", "offset": offset, "maxBytes": 4096})
+        self.assertIn("ECHO:first", first["output"])
+        self.assertGreater(first["nextOffset"], offset)
+
+        empty = client.request({"action": "read", "name": "echo", "offset": first["nextOffset"], "maxBytes": 4096})
+        self.assertEqual("", empty["output"])
+        self.assertEqual(first["nextOffset"], empty["nextOffset"])
+
+        self.run_json("cmd", "echo", "second", "--wait", "1", "--bytes", "4096")
+        second = client.request({"action": "read", "name": "echo", "offset": empty["nextOffset"], "maxBytes": 4096})
+        self.assertNotIn("ECHO:first", second["output"])
+        self.assertIn("ECHO:second", second["output"])
+
+    def test_attach_accepts_piped_input_and_detaches_on_eof(self) -> None:
+        self.start_echo_process()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--root",
+                str(self.root),
+                "attach",
+                "echo",
+                "--history",
+                "0",
+                "--poll",
+                "0.05",
+                "--drain-on-eof",
+                "1",
+            ],
+            input="hello\nexit\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            self.fail(f"attach failed\nstdout={proc.stdout}\nstderr={proc.stderr}")
+        self.assertIn("ECHO:hello", proc.stdout)
+        self.assertIn("BYE", proc.stdout)
+
     def test_concurrent_cmd_writes_do_not_interleave_stdin(self) -> None:
         self.start_echo_process()
 
