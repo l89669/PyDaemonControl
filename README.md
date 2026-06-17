@@ -52,7 +52,7 @@ pydaemoncontrol --root /srv/example start app -- ./run-server.sh
 Save a reusable process profile and start it later:
 
 ```bash
-pydaemoncontrol --root /srv/example profile set app --restart on-failure --restart-delay 3 -- ./run-server.sh
+pydaemoncontrol --root /srv/example profile set app --restart on-failure --restart-delay 3 --shutdown-command stop -- ./run-server.sh
 pydaemoncontrol --root /srv/example start app
 ```
 
@@ -115,7 +115,9 @@ Restart an existing daemon-managed process without changing its command:
 pydaemoncontrol --root /srv/example restart app --grace 5
 ```
 
-Stop a child process:
+Stop a child process. If the process spec has a shutdown command, it is written
+to stdin first and the process gets the full grace period to exit before force
+termination:
 
 ```bash
 pydaemoncontrol --root /srv/example stop app --grace 5 --suppress-restart
@@ -145,6 +147,7 @@ pydaemoncontrol \
   --restart-delay 10 \
   --restart-max-attempts 5 \
   --restart-window 300 \
+  --shutdown-command stop \
   --cwd /home/minecraft/server \
   -- java -Xms512M -Xmx2G -jar spigot.jar nogui
 ```
@@ -160,7 +163,7 @@ Run server console commands through the daemon:
 ```bash
 pydaemoncontrol --root /home/minecraft/server cmd mc 'list' --wait 1 --bytes 12000
 pydaemoncontrol --root /home/minecraft/server cmd mc 'say hello from pydaemoncontrol' --wait 1 --bytes 12000
-pydaemoncontrol --root /home/minecraft/server cmd mc 'stop' --wait 5 --bytes 20000
+pydaemoncontrol --root /home/minecraft/server stop mc --grace 30 --suppress-restart
 ```
 
 Or attach a human-facing console:
@@ -214,11 +217,12 @@ profile records:
 - argv
 - log rotation settings
 - restart policy
+- shutdown command
 
 Manage profiles with:
 
 ```bash
-pydaemoncontrol --root /srv/example profile set app --restart on-failure -- ./run-server.sh
+pydaemoncontrol --root /srv/example profile set app --restart on-failure --shutdown-command stop -- ./run-server.sh
 pydaemoncontrol --root /srv/example profile list
 pydaemoncontrol --root /srv/example profile show app
 pydaemoncontrol --root /srv/example profile remove app
@@ -228,28 +232,31 @@ pydaemoncontrol --root /srv/example profile remove app
 provided, the command is an immediate one-shot start spec:
 
 ```bash
-pydaemoncontrol --root /srv/example start app -- ./run-once.sh
+pydaemoncontrol --root /srv/example start app --shutdown-command stop -- ./run-once.sh
 ```
 
 Once a daemon has a process entry named `app`, `start app` never replaces that
-entry's argv, cwd, log settings, or restart policy. If the entry is stopped,
-`start app` starts the existing entry's original spec again. If a profile was
-changed, or if a different one-shot argv is provided for the same name, `start`
-rejects the operation. Use `forget app` after the entry is stopped to discard
-the in-memory entry, then `start app` again to create it from the new profile or
-argv.
+entry's argv, cwd, log settings, restart policy, or shutdown command. If the
+entry is stopped, `start app` starts the existing entry's original spec again.
+If a profile was changed, or if a different one-shot argv or shutdown command is
+provided for the same name, `start` rejects the operation. Use `forget app`
+after the entry is stopped to discard the in-memory entry, then `start app`
+again to create it from the new profile or argv.
 
 `restart app` is deliberately narrower: it only restarts an existing process
 already managed by the daemon, using that process's current argv, cwd, log
-settings, and restart policy. It does not read a profile and it does not accept a
-replacement command.
+settings, restart policy, and shutdown command. It does not read a profile and
+it does not accept a replacement command.
 
 Process spec options can be placed before or after the name:
 
 ```bash
-pydaemoncontrol --root /srv/example profile set --restart on-failure app -- ./run-server.sh
-pydaemoncontrol --root /srv/example profile set app --restart on-failure -- ./run-server.sh
+pydaemoncontrol --root /srv/example profile set --restart on-failure --shutdown-command stop app -- ./run-server.sh
+pydaemoncontrol --root /srv/example profile set app --restart on-failure --shutdown-command stop -- ./run-server.sh
 ```
+
+Older profiles without `shutdownCommand` still load. They behave as if the field
+were `null`.
 
 ## Restart Policies
 
@@ -271,6 +278,14 @@ For line-oriented server consoles that exit with code `0` after a normal
 shutdown command, `on-failure` is usually the safer default: crashes restart,
 while controlled exits stay stopped. Use `always` only when you explicitly want
 the process to come back after any unsuppressed exit.
+
+`--shutdown-command TEXT` stores a single stdin line in the process spec. When
+`stop`, `restart`, or `daemon-stop --stop-children` needs to stop a running
+process, PyDaemonControl writes `TEXT\n` to the child stdin first. If the
+process exits within `--grace`, no signal is sent. If the write cannot be
+confirmed, or if the process is still running after `--grace`, PyDaemonControl
+falls back to the normal signal/kill stop path. This is useful for console
+servers such as Minecraft, where `stop` saves worlds before the JVM exits.
 
 `cmd/send --suppress-restart` and `stop --suppress-restart` set a one-shot
 suppression flag for the process's next exit. They do not wait for the process

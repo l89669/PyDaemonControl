@@ -318,10 +318,17 @@ def normalize_process_spec(
     max_log_bytes: Any,
     rotate_count: Any,
     restart_policy: Any | None,
+    shutdown_command: Any | None,
 ) -> dict[str, Any]:
     name = sanitize_name(name)
     if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
         raise RpcError("argv must be a non-empty list of strings")
+    if shutdown_command is not None:
+        shutdown_command = str(shutdown_command)
+        if not shutdown_command:
+            shutdown_command = None
+        elif "\n" in shutdown_command or "\r" in shutdown_command:
+            raise RpcError("shutdown command must be a single line")
     cwd = Path(cwd_raw).resolve() if cwd_raw else root
     return {
         "name": name,
@@ -330,6 +337,7 @@ def normalize_process_spec(
         "maxLogBytes": require_int_at_least(max_log_bytes, "maxLogBytes", 0),
         "rotateCount": require_int_at_least(rotate_count, "rotateCount", 0),
         "restart": normalize_restart_policy(restart_policy),
+        "shutdownCommand": shutdown_command,
     }
 
 
@@ -342,6 +350,7 @@ def profile_to_start_request(profile: dict[str, Any]) -> dict[str, Any]:
         "maxLogBytes": profile["maxLogBytes"],
         "rotateCount": profile["rotateCount"],
         "restart": profile["restart"],
+        "shutdownCommand": profile.get("shutdownCommand"),
     }
 
 
@@ -376,6 +385,7 @@ def add_process_spec_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--restart-delay", type=float, default=DEFAULT_RESTART_DELAY)
     parser.add_argument("--restart-max-attempts", type=int, default=DEFAULT_RESTART_MAX_ATTEMPTS)
     parser.add_argument("--restart-window", type=float, default=DEFAULT_RESTART_WINDOW)
+    parser.add_argument("--shutdown-command", default=None)
 
 
 def add_outer_process_option_arguments(parser: argparse.ArgumentParser) -> None:
@@ -386,6 +396,7 @@ def add_outer_process_option_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--restart-delay", type=float, dest="proc_restart_delay")
     parser.add_argument("--restart-max-attempts", type=int, dest="proc_restart_max_attempts")
     parser.add_argument("--restart-window", type=float, dest="proc_restart_window")
+    parser.add_argument("--shutdown-command", dest="proc_shutdown_command")
 
 
 def apply_outer_process_options(spec_args: Any, outer_args: Any) -> Any:
@@ -397,6 +408,7 @@ def apply_outer_process_options(spec_args: Any, outer_args: Any) -> Any:
         "proc_restart_delay": "restart_delay",
         "proc_restart_max_attempts": "restart_max_attempts",
         "proc_restart_window": "restart_window",
+        "proc_shutdown_command": "shutdown_command",
     }
     for source, target in mapping.items():
         value = getattr(outer_args, source, None)
@@ -678,6 +690,7 @@ class HostedProcess:
     log_path: Path
     supervisor: ProcessSupervisor
     restart_policy: dict[str, Any] = field(default_factory=default_restart_policy)
+    shutdown_command: str | None = None
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
     rotate_count: int = DEFAULT_ROTATE_COUNT
     tail_chars: int = DEFAULT_TAIL_CHARS
@@ -763,6 +776,7 @@ class HostedProcess:
                 "nextSeq": self.next_seq,
                 "tailStartSeq": self._tail_records[0].seq if self._tail_records else self.next_seq,
                 "restartPolicy": self.restart_policy,
+                "shutdownCommand": self.shutdown_command,
                 "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
                 "restartCount": self.restart_count,
                 "lastRestartAt": self.last_restart_at,
@@ -1130,6 +1144,56 @@ class HostedProcess:
         )
         return payload_data
 
+    def _wait_for_process_exit(self, proc: subprocess.Popen[bytes], timeout: float) -> bool:
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                return True
+            time.sleep(0.05)
+        return proc.poll() is not None
+
+    def _write_shutdown_command(self) -> bool:
+        if not self.shutdown_command:
+            return False
+        if not self.running or self.proc is None or self.proc.stdin is None:
+            self.write_event("system", "shutdown command skipped: process is not running")
+            return False
+        payload = self.shutdown_command + "\n"
+        job = StdinJob(
+            payload=payload.encode("utf-8"),
+            display_text=format_stdin_log(payload.rstrip("\n")),
+        )
+        try:
+            self._stdin_queue.put_nowait(job)
+        except queue.Full:
+            self.write_event("system", "shutdown command skipped: stdin queue is full")
+            return False
+        if not job.done.wait(DEFAULT_INPUT_WAIT):
+            self.write_event("system", f"shutdown command write not confirmed within {DEFAULT_INPUT_WAIT:g}s")
+            return False
+        if job.error is not None:
+            self.write_event("system", f"shutdown command failed: {job.error}")
+            return False
+        if not job.written:
+            self.write_event("system", "shutdown command was not written")
+            return False
+        self.write_event("system", "shutdown command written")
+        return True
+
+    def _stop_running_process(self, grace: float) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        if self.shutdown_command:
+            if self._write_shutdown_command():
+                if self._wait_for_process_exit(proc, grace):
+                    return
+                self.write_event("system", f"shutdown command grace expired after {grace:g}s")
+                self.supervisor.stop_process(proc, self.write_event, 0.0)
+                return
+            self.write_event("system", "falling back to process signal stop")
+        self.supervisor.stop_process(proc, self.write_event, grace)
+
     def stop(self, grace: float, suppress_restart: bool = False) -> dict[str, Any]:
         if not self.running or self.proc is None:
             canceled = self.cancel_pending_restart("stop requested")
@@ -1138,7 +1202,7 @@ class HostedProcess:
         if suppress_restart:
             self.suppress_restart_on_next_exit = True
             self.write_event("system", "next process exit will suppress restart")
-        self.supervisor.stop_process(self.proc, self.write_event, grace)
+        self._stop_running_process(grace)
         return {"stopped": True, "status": self.status()}
 
     def restart(self, grace: float) -> dict[str, Any]:
@@ -1146,7 +1210,7 @@ class HostedProcess:
             raise RpcError(self._pending_restart_message())
         if self.running and self.proc is not None:
             self.suppress_restart_on_next_exit = True
-            self.supervisor.stop_process(self.proc, self.write_event, grace)
+            self._stop_running_process(grace)
         self.start(restarted=True)
         return {"restarted": True, "status": self.status()}
 
@@ -1220,6 +1284,7 @@ class ProcHostDaemon:
             and entry.max_log_bytes == int(spec["maxLogBytes"])
             and entry.rotate_count == int(spec["rotateCount"])
             and normalize_restart_policy(entry.restart_policy) == normalize_restart_policy(spec["restart"])
+            and entry.shutdown_command == spec.get("shutdownCommand")
         )
 
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
@@ -1294,6 +1359,7 @@ class ProcHostDaemon:
                     req.get("maxLogBytes", self.max_log_bytes),
                     req.get("rotateCount", self.rotate_count),
                     req.get("restart"),
+                    req.get("shutdownCommand"),
                 )
                 if not self._entry_matches_spec(old_entry, spec):
                     raise RpcError(f"{name} already exists with a different process spec; forget it first")
@@ -1310,6 +1376,7 @@ class ProcHostDaemon:
             req.get("maxLogBytes", self.max_log_bytes),
             req.get("rotateCount", self.rotate_count),
             req.get("restart"),
+            req.get("shutdownCommand"),
         )
         name = spec["name"]
         log_path = self.paths["logs"] / f"{name}.log"
@@ -1320,6 +1387,7 @@ class ProcHostDaemon:
             log_path=log_path,
             supervisor=self.platform.processes,
             restart_policy=dict(spec["restart"]),
+            shutdown_command=spec["shutdownCommand"],
             max_log_bytes=int(spec["maxLogBytes"]),
             rotate_count=int(spec["rotateCount"]),
         )
@@ -1638,6 +1706,7 @@ def main(argv: list[str] | None = None) -> int:
                     spec_args.max_log_bytes,
                     spec_args.rotate_count,
                     restart_policy_from_args(spec_args),
+                    spec_args.shutdown_command,
                 )
                 profiles[profile["name"]] = profile
                 save_profiles(client.paths, profiles_doc)
@@ -1673,6 +1742,7 @@ def main(argv: list[str] | None = None) -> int:
                         spec_args.max_log_bytes,
                         spec_args.rotate_count,
                         restart_policy_from_args(spec_args),
+                        spec_args.shutdown_command,
                     )
                 )
             else:

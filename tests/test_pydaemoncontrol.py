@@ -99,6 +99,27 @@ class PyDaemonControlTest(unittest.TestCase):
             code,
         )
 
+    def graceful_shutdown_code(self, marker_name: str, *, keep_running_after_command: bool = False) -> str:
+        if keep_running_after_command:
+            return (
+                "import pathlib, sys, time\n"
+                "print('READY', flush=True)\n"
+                "for line in sys.stdin:\n"
+                "    if line.strip() == 'quit':\n"
+                f"        pathlib.Path('{marker_name}').write_text('ignored')\n"
+                "        print('IGNORED_SHUTDOWN', flush=True)\n"
+                "        time.sleep(30)\n"
+            )
+        return (
+            "import pathlib, sys\n"
+            "print('READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    if line.strip() == 'quit':\n"
+            f"        pathlib.Path('{marker_name}').write_text('graceful')\n"
+            "        print('GRACEFUL_SHUTDOWN', flush=True)\n"
+            "        sys.exit(0)\n"
+        )
+
     def test_single_daemon_per_root(self) -> None:
         first = self.run_json("daemon-start")
         second = self.run_json("daemon-start")
@@ -185,6 +206,65 @@ class PyDaemonControlTest(unittest.TestCase):
 
         removed = self.run_json("profile", "remove", "profiled")
         self.assertTrue(removed["removed"])
+
+    def test_profile_shutdown_command_stops_process_gracefully(self) -> None:
+        code = self.graceful_shutdown_code("profile-graceful.txt")
+        saved = self.run_json(
+            "profile",
+            "set",
+            "profilegrace",
+            "--shutdown-command",
+            "quit",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+        self.assertEqual("quit", saved["profile"]["shutdownCommand"])
+        self.run_json("start", "profilegrace")
+
+        stopped = self.run_json("stop", "profilegrace", "--grace", "2", "--suppress-restart", timeout=6)
+
+        self.assertTrue(stopped["stopped"])
+        self.assertEqual("graceful", (self.root / "profile-graceful.txt").read_text())
+        proc_status = self.run_json("status")["processes"]["profilegrace"]
+        self.assertFalse(proc_status["running"])
+        self.assertEqual("quit", proc_status["shutdownCommand"])
+        tail = self.run_json("tail", "profilegrace", "--bytes", "4096")
+        self.assertIn("quit\n", self.stream_text(tail, "stdin"))
+        self.assertIn("shutdown command written", self.stream_text(tail, "system"))
+
+    def test_one_shot_shutdown_command_is_part_of_fixed_spec(self) -> None:
+        code = self.graceful_shutdown_code("oneshot-graceful.txt")
+        self.run_json(
+            "start",
+            "oneshotgrace",
+            "--shutdown-command",
+            "quit",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+        self.run_json("stop", "oneshotgrace", "--grace", "2", "--suppress-restart", timeout=6)
+
+        proc = self.run_ctl(
+            "start",
+            "oneshotgrace",
+            "--shutdown-command",
+            "other",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("different process spec", proc.stderr)
 
     def test_one_shot_start_reuses_stopped_entry_and_rejects_replacement(self) -> None:
         code = (
@@ -323,6 +403,48 @@ class PyDaemonControlTest(unittest.TestCase):
         self.assertIn("ECHO2:two", self.stream_text(second, "stdout"))
         self.assertEqual("2", (self.root / "restart-count.txt").read_text())
 
+    def test_restart_uses_shutdown_command_before_starting_again(self) -> None:
+        code = (
+            "import pathlib, sys\n"
+            "starts = pathlib.Path('restart-grace-starts.txt')\n"
+            "count = int(starts.read_text()) if starts.exists() else 0\n"
+            "starts.write_text(str(count + 1))\n"
+            "print('START:%d' % (count + 1), flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    if line.strip() == 'quit':\n"
+            "        pathlib.Path('restart-graceful.txt').write_text('graceful')\n"
+            "        print('GRACEFUL_RESTART', flush=True)\n"
+            "        sys.exit(0)\n"
+        )
+        self.run_json(
+            "start",
+            "restartgrace",
+            "--shutdown-command",
+            "quit",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+
+        restarted = self.run_json("restart", "restartgrace", "--grace", "2", timeout=6)
+
+        self.assertTrue(restarted["restarted"])
+        self.assertEqual("graceful", (self.root / "restart-graceful.txt").read_text())
+        self.wait_process_status(
+            "restartgrace",
+            lambda item: item.get("running") is True and item.get("restartCount") == 1,
+        )
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if (self.root / "restart-grace-starts.txt").read_text() == "2":
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("restartgrace did not start a second time")
+        self.assertEqual("2", (self.root / "restart-grace-starts.txt").read_text())
+
     def test_on_failure_restart_policy_restarts_process(self) -> None:
         code = (
             "import pathlib, sys\n"
@@ -428,6 +550,49 @@ class PyDaemonControlTest(unittest.TestCase):
         time.sleep(1.3)
 
         self.assertEqual("1", (self.root / "daemonpending-attempts.txt").read_text())
+
+    def test_daemon_stop_uses_shutdown_command_for_running_children(self) -> None:
+        code = self.graceful_shutdown_code("daemon-graceful.txt")
+        self.run_json(
+            "start",
+            "daemongrace",
+            "--shutdown-command",
+            "quit",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+
+        stopped = self.run_json("daemon-stop", "--stop-children", "--grace", "2", timeout=6)
+        time.sleep(0.5)
+
+        self.assertTrue(stopped["stopping"])
+        self.assertEqual("graceful", (self.root / "daemon-graceful.txt").read_text())
+
+    def test_shutdown_command_timeout_falls_back_to_force_stop(self) -> None:
+        code = self.graceful_shutdown_code("ignored-shutdown.txt", keep_running_after_command=True)
+        self.run_json(
+            "start",
+            "ignoregrace",
+            "--shutdown-command",
+            "quit",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+
+        stopped = self.run_json("stop", "ignoregrace", "--grace", "0.2", "--suppress-restart", timeout=6)
+
+        self.assertTrue(stopped["stopped"])
+        self.assertEqual("ignored", (self.root / "ignored-shutdown.txt").read_text())
+        proc_status = self.run_json("status")["processes"]["ignoregrace"]
+        self.assertFalse(proc_status["running"])
+        tail = self.run_json("tail", "ignoregrace", "--bytes", "4096")
+        self.assertIn("shutdown command grace expired", self.stream_text(tail, "system"))
 
     def test_stop_suppress_restart_blocks_always_restart_once(self) -> None:
         code = "import time; print('SLEEPING', flush=True); time.sleep(30)"
