@@ -701,6 +701,7 @@ class HostedProcess:
     _tail_records: deque[OutputRecord] = field(default_factory=deque)
     _tail_bytes: int = 0
     _restart_attempts: deque[float] = field(default_factory=deque)
+    _restart_generation: int = 0
 
     def __post_init__(self) -> None:
         self._cond = threading.Condition(self._lock)
@@ -714,6 +715,7 @@ class HostedProcess:
 
     def close_log(self) -> None:
         with self._lock:
+            self._cancel_pending_restart_locked()
             self._logs_closed = True
             for fd in self._fds.values():
                 os.close(fd)
@@ -722,6 +724,28 @@ class HostedProcess:
     @property
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+
+    @property
+    def restart_pending(self) -> bool:
+        return self.restart_pending_until is not None
+
+    def _pending_restart_message(self) -> str:
+        return f"{self.name} has a restart pending; stop it first or wait until it restarts"
+
+    def _cancel_pending_restart_locked(self) -> bool:
+        canceled = self.restart_pending_until is not None
+        self._restart_generation += 1
+        self.restart_pending_until = None
+        self.suppress_restart_on_next_exit = False
+        self._cond.notify_all()
+        return canceled
+
+    def cancel_pending_restart(self, reason: str) -> bool:
+        with self._cond:
+            canceled = self._cancel_pending_restart_locked()
+            if canceled:
+                self._append_records_locked("system", [f"restart canceled: {reason}\n"])
+            return canceled
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -745,34 +769,40 @@ class HostedProcess:
                 "restartPendingUntil": self.restart_pending_until,
             }
 
-    def start(self, restarted: bool = False) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            raise RpcError(f"{self.name} is already running")
-        self.started_at = time.time()
-        self.exited_at = None
-        self.exit_code = None
-        self.suppress_restart_on_next_exit = False
-        self.restart_pending_until = None
-        self._stdin_queue = queue.Queue(maxsize=STDIN_QUEUE_LIMIT)
-        if restarted:
-            self.last_restart_at = self.started_at
-            self.restart_count += 1
-        self.write_event("system", ("restarting: " if restarted else "starting: ") + " ".join(self.argv))
-        proc = subprocess.Popen(
-            self.argv,
-            cwd=str(self.cwd),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            **self.supervisor.popen_kwargs(),
-        )
-        self.proc = proc
-        stdin_queue = self._stdin_queue
-        threading.Thread(target=self._reader, args=("stdout", proc.stdout), daemon=True).start()
-        threading.Thread(target=self._reader, args=("stderr", proc.stderr), daemon=True).start()
-        threading.Thread(target=self._stdin_writer, args=(proc, stdin_queue), daemon=True).start()
-        threading.Thread(target=self._monitor, args=(proc, stdin_queue), daemon=True).start()
+    def start(self, restarted: bool = False, from_pending_restart: bool = False) -> None:
+        with self._cond:
+            if self._logs_closed:
+                raise RpcError(f"{self.name} is closed")
+            if self.proc is not None and self.proc.poll() is None:
+                raise RpcError(f"{self.name} is already running")
+            if self.restart_pending_until is not None and not from_pending_restart:
+                raise RpcError(self._pending_restart_message())
+            self._restart_generation += 1
+            self.started_at = time.time()
+            self.exited_at = None
+            self.exit_code = None
+            self.suppress_restart_on_next_exit = False
+            self.restart_pending_until = None
+            self._stdin_queue = queue.Queue(maxsize=STDIN_QUEUE_LIMIT)
+            if restarted:
+                self.last_restart_at = self.started_at
+                self.restart_count += 1
+            self.write_event("system", ("restarting: " if restarted else "starting: ") + " ".join(self.argv))
+            proc = subprocess.Popen(
+                self.argv,
+                cwd=str(self.cwd),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                **self.supervisor.popen_kwargs(),
+            )
+            self.proc = proc
+            stdin_queue = self._stdin_queue
+            threading.Thread(target=self._reader, args=("stdout", proc.stdout), daemon=True).start()
+            threading.Thread(target=self._reader, args=("stderr", proc.stderr), daemon=True).start()
+            threading.Thread(target=self._stdin_writer, args=(proc, stdin_queue), daemon=True).start()
+            threading.Thread(target=self._monitor, args=(proc, stdin_queue), daemon=True).start()
 
     def _reader(self, stream_name: str, stream: Any) -> None:
         try:
@@ -824,25 +854,37 @@ class HostedProcess:
         return True
 
     def _maybe_schedule_restart(self, code: int) -> None:
-        if not self._restart_allowed(code):
-            return
-        policy = normalize_restart_policy(self.restart_policy)
-        delay = float(policy["delay"])
-        self.restart_pending_until = time.time() + delay
-        self.write_event("system", f"restart scheduled in {delay:g}s by policy {policy['mode']}")
-        threading.Thread(target=self._restart_after_delay, args=(delay,), daemon=True).start()
+        with self._cond:
+            if not self._restart_allowed(code):
+                return
+            policy = normalize_restart_policy(self.restart_policy)
+            delay = float(policy["delay"])
+            self._restart_generation += 1
+            token = self._restart_generation
+            self.restart_pending_until = time.time() + delay
+            self._append_records_locked(
+                "system",
+                [f"restart scheduled in {delay:g}s by policy {policy['mode']}\n"],
+            )
+        threading.Thread(target=self._restart_after_delay, args=(delay, token), daemon=True).start()
 
-    def _restart_after_delay(self, delay: float) -> None:
+    def _restart_after_delay(self, delay: float, token: int) -> None:
         if delay > 0:
             time.sleep(delay)
-        if self.running:
-            self.restart_pending_until = None
-            return
-        try:
-            self.start(restarted=True)
-        except Exception as exc:
-            self.restart_pending_until = None
-            self.write_event("system", f"restart failed: {exc}")
+        with self._cond:
+            if token != self._restart_generation or self.restart_pending_until is None:
+                return
+            if self._logs_closed:
+                self._cancel_pending_restart_locked()
+                return
+            if self.running:
+                self._cancel_pending_restart_locked()
+                return
+            try:
+                self.start(restarted=True, from_pending_restart=True)
+            except Exception as exc:
+                self._cancel_pending_restart_locked()
+                self._append_records_locked("system", [f"restart failed: {exc}\n"])
 
     def _stdin_writer(self, proc: subprocess.Popen[bytes], stdin_queue: queue.Queue[StdinJob | None]) -> None:
         while True:
@@ -1045,6 +1087,8 @@ class HostedProcess:
         suppress_restart: bool = False,
     ) -> dict[str, Any]:
         if not self.running or self.proc is None or self.proc.stdin is None:
+            if self.restart_pending:
+                raise RpcError(f"{self.name} is not running; restart pending")
             raise RpcError(f"{self.name} is not running")
         payload = text + ("\n" if append_newline else "")
         job = StdinJob(payload=payload.encode("utf-8"), display_text=format_stdin_log(payload.rstrip("\n")))
@@ -1088,21 +1132,20 @@ class HostedProcess:
 
     def stop(self, grace: float, suppress_restart: bool = False) -> dict[str, Any]:
         if not self.running or self.proc is None:
-            if suppress_restart:
-                self.suppress_restart_on_next_exit = True
-            self.restart_pending_until = None
-            return {"stopped": False, "reason": "not running", "status": self.status()}
+            canceled = self.cancel_pending_restart("stop requested")
+            reason = "restart canceled" if canceled else "not running"
+            return {"stopped": False, "reason": reason, "status": self.status()}
         if suppress_restart:
             self.suppress_restart_on_next_exit = True
             self.write_event("system", "next process exit will suppress restart")
-        self.restart_pending_until = None
         self.supervisor.stop_process(self.proc, self.write_event, grace)
         return {"stopped": True, "status": self.status()}
 
     def restart(self, grace: float) -> dict[str, Any]:
+        if self.restart_pending:
+            raise RpcError(self._pending_restart_message())
         if self.running and self.proc is not None:
             self.suppress_restart_on_next_exit = True
-            self.restart_pending_until = None
             self.supervisor.stop_process(self.proc, self.write_event, grace)
         self.start(restarted=True)
         return {"restarted": True, "status": self.status()}
@@ -1170,6 +1213,15 @@ class ProcHostDaemon:
             raise RpcError(f"unknown process: {name}")
         return entry
 
+    def _entry_matches_spec(self, entry: HostedProcess, spec: dict[str, Any]) -> bool:
+        return (
+            entry.argv == list(spec["argv"])
+            and entry.cwd.resolve() == Path(spec["cwd"]).resolve()
+            and entry.max_log_bytes == int(spec["maxLogBytes"])
+            and entry.rotate_count == int(spec["rotateCount"])
+            and normalize_restart_policy(entry.restart_policy) == normalize_restart_policy(spec["restart"])
+        )
+
     def handle(self, req: dict[str, Any]) -> dict[str, Any]:
         action = req.get("action")
         if action == "ping":
@@ -1186,6 +1238,8 @@ class ProcHostDaemon:
             name = sanitize_name(str(req.get("name", "")))
             entry = self.get_process(name)
             return entry.restart(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
+        if action == "forget":
+            return self._forget(req)
         if action == "send":
             entry = self.get_process(str(req.get("name", "")))
             return entry.send(
@@ -1216,15 +1270,41 @@ class ProcHostDaemon:
             if req.get("stopChildren", False):
                 grace = require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False)
                 for entry in list(self.processes.values()):
+                    entry.cancel_pending_restart("daemon stopping")
                     entry.stop(grace, suppress_restart=True)
             self._shutdown.set()
             return {"stopping": True, "daemonPid": os.getpid()}
         raise RpcError(f"unknown action: {action}")
 
     def _start(self, req: dict[str, Any]) -> dict[str, Any]:
+        name = sanitize_name(str(req.get("name", "")))
+        old_entry = self.processes.get(name)
+        has_spec = "argv" in req
+        if old_entry is not None:
+            if old_entry.running:
+                raise RpcError(f"{name} is already running")
+            if old_entry.restart_pending:
+                raise RpcError(old_entry._pending_restart_message())
+            if has_spec:
+                spec = normalize_process_spec(
+                    self.root,
+                    name,
+                    req.get("cwd"),
+                    req.get("argv"),
+                    req.get("maxLogBytes", self.max_log_bytes),
+                    req.get("rotateCount", self.rotate_count),
+                    req.get("restart"),
+                )
+                if not self._entry_matches_spec(old_entry, spec):
+                    raise RpcError(f"{name} already exists with a different process spec; forget it first")
+            old_entry.start()
+            return {"started": True, "reused": True, "status": old_entry.status()}
+
+        if not has_spec:
+            raise RpcError(f"unknown process: {name}; provide argv or create a profile")
         spec = normalize_process_spec(
             self.root,
-            str(req.get("name", "")),
+            name,
             req.get("cwd"),
             req.get("argv"),
             req.get("maxLogBytes", self.max_log_bytes),
@@ -1232,11 +1312,6 @@ class ProcHostDaemon:
             req.get("restart"),
         )
         name = spec["name"]
-        if name in self.processes and self.processes[name].running:
-            raise RpcError(f"{name} is already running")
-        old_entry = self.processes.get(name)
-        if old_entry is not None:
-            old_entry.close_log()
         log_path = self.paths["logs"] / f"{name}.log"
         entry = HostedProcess(
             name=name,
@@ -1255,6 +1330,18 @@ class ProcHostDaemon:
             raise
         self.processes[name] = entry
         return {"started": True, "status": entry.status()}
+
+    def _forget(self, req: dict[str, Any]) -> dict[str, Any]:
+        name = sanitize_name(str(req.get("name", "")))
+        entry = self.get_process(name)
+        if entry.running:
+            raise RpcError(f"{name} is running; stop it before forgetting it")
+        if entry.restart_pending:
+            raise RpcError(f"{name} has a restart pending; stop it before forgetting it")
+        status = entry.status()
+        entry.close_log()
+        del self.processes[name]
+        return {"forgotten": True, "name": name, "status": status}
 
 
 class ProcHostClient:
@@ -1379,19 +1466,23 @@ def run_attach(
                 if eof_deadline is None:
                     eof_deadline = time.time() + drain_on_eof
                 continue
-            response = client.request(
-                {
-                    "action": "send",
-                    "name": name,
-                    "text": line,
-                    "newline": True,
-                    "inputWait": input_wait,
-                    "wait": 0.0,
-                    "quiet": 0.0,
-                    "maxBytes": 1,
-                },
-                timeout=client.timeout + input_wait,
-            )
+            try:
+                response = client.request(
+                    {
+                        "action": "send",
+                        "name": name,
+                        "text": line,
+                        "newline": True,
+                        "inputWait": input_wait,
+                        "wait": 0.0,
+                        "quiet": 0.0,
+                        "maxBytes": 1,
+                    },
+                    timeout=client.timeout + input_wait,
+                )
+            except Exception as exc:
+                print(f"[pydaemoncontrol] input rejected: {exc}", file=sys.stderr, flush=True)
+                continue
             if not response.get("written", False):
                 print(
                     f"[pydaemoncontrol] input queued; write not confirmed within {input_wait:.3f}s",
@@ -1407,11 +1498,14 @@ def run_attach(
         since_seq = int(data.get("nextSeq", since_seq))
         proc_status = data.get("status", {})
         running = bool(proc_status.get("running", False)) if isinstance(proc_status, dict) else False
+        restart_pending = (
+            proc_status.get("restartPendingUntil") is not None if isinstance(proc_status, dict) else False
+        )
 
         if eof_deadline is not None:
             if time.time() >= eof_deadline:
                 return 0
-        elif not running:
+        elif not running and not restart_pending:
             return 0
 
         time.sleep(poll)
@@ -1444,6 +1538,9 @@ def build_parser() -> argparse.ArgumentParser:
     restart = sub.add_parser("restart", help="Restart an existing daemon-managed process")
     restart.add_argument("name")
     restart.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
+
+    forget = sub.add_parser("forget", help="Forget a stopped process entry")
+    forget.add_argument("name")
 
     profile = sub.add_parser("profile", help="Manage saved process profiles")
     profile_sub = profile.add_subparsers(dest="profile_cmd", required=True)
@@ -1567,22 +1664,45 @@ def main(argv: list[str] | None = None) -> int:
             )
             spec_args = apply_outer_process_options(spec_args, args)
             if proc_argv:
-                profile = normalize_process_spec(
-                    root,
-                    spec_args.name,
-                    spec_args.cwd,
-                    proc_argv,
-                    spec_args.max_log_bytes,
-                    spec_args.rotate_count,
-                    restart_policy_from_args(spec_args),
+                start_request = profile_to_start_request(
+                    normalize_process_spec(
+                        root,
+                        spec_args.name,
+                        spec_args.cwd,
+                        proc_argv,
+                        spec_args.max_log_bytes,
+                        spec_args.rotate_count,
+                        restart_policy_from_args(spec_args),
+                    )
                 )
             else:
-                profile = get_profile(client.paths, spec_args.name)
+                try:
+                    start_request = profile_to_start_request(get_profile(client.paths, spec_args.name))
+                except RpcError as exc:
+                    if not str(exc).startswith("unknown profile:"):
+                        raise
+                    if not client.daemon_running():
+                        raise
+                    start_request = {
+                        "action": "start",
+                        "name": sanitize_name(spec_args.name),
+                    }
             if not client.daemon_running():
                 client.start_daemon(max_log_bytes, rotate_count)
             print_json(
                 client.request(
-                    profile_to_start_request(profile),
+                    start_request,
+                    timeout=client.timeout,
+                )
+            )
+            return 0
+        if args.cmd == "forget":
+            print_json(
+                client.request(
+                    {
+                        "action": "forget",
+                        "name": args.name,
+                    },
                     timeout=client.timeout,
                 )
             )

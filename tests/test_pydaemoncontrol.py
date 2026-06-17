@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,46 +60,69 @@ class PyDaemonControlTest(unittest.TestCase):
         )
         self.run_ctl("start", "echo", "--", sys.executable, "-u", "-c", code)
 
+    def wait_process_status(self, name: str, predicate: Any, timeout: float = 5.0) -> dict:
+        client = pdc.ProcHostClient(self.root, SCRIPT, timeout=2)
+        deadline = time.time() + timeout
+        status: dict = {}
+        while time.time() < deadline:
+            status = client.request({"action": "status"})
+            proc_status = status["processes"].get(name, {})
+            if predicate(proc_status):
+                return proc_status
+            time.sleep(0.05)
+        self.fail(f"timed out waiting for {name}: {status}")
+
+    def start_flapping_process(self, name: str, delay: str = "0.5") -> None:
+        code = (
+            "import pathlib, sys\n"
+            f"path = pathlib.Path('{name}-attempts.txt')\n"
+            "count = int(path.read_text()) if path.exists() else 0\n"
+            "path.write_text(str(count + 1))\n"
+            "print('ATTEMPT:%d' % (count + 1), flush=True)\n"
+            "if count == 0:\n"
+            "    sys.exit(7)\n"
+            "print('RESTARTED', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('AFTER_RESTART:' + line.strip(), flush=True)\n"
+        )
+        self.run_ctl(
+            "start",
+            name,
+            "--restart",
+            "on-failure",
+            "--restart-delay",
+            delay,
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+
     def test_single_daemon_per_root(self) -> None:
         first = self.run_json("daemon-start")
         second = self.run_json("daemon-start")
         self.assertEqual(first["pid"], second["pid"])
 
-    def test_start_replacement_closes_old_log_handles(self) -> None:
+    def test_forget_closes_stopped_log_handles(self) -> None:
         daemon = pdc.ProcHostDaemon(self.root, max_log_bytes=1024 * 1024, rotate_count=1)
-        old_entry = pdc.HostedProcess(
+        entry = pdc.HostedProcess(
             name="svc",
             argv=[sys.executable, "-c", "pass"],
             cwd=self.root,
             log_path=daemon.paths["logs"] / "svc.log",
             supervisor=daemon.platform.processes,
         )
-        old_entry.write_event("system", "old entry")
-        self.assertTrue(old_entry._fds)
-        daemon.processes["svc"] = old_entry
+        entry.write_event("system", "old entry")
+        self.assertTrue(entry._fds)
+        daemon.processes["svc"] = entry
 
-        original_start = pdc.HostedProcess.start
+        response = daemon.handle({"action": "forget", "name": "svc"})
 
-        def fake_start(entry: pdc.HostedProcess, restarted: bool = False) -> None:
-            entry.write_event("system", "new entry")
-
-        try:
-            pdc.HostedProcess.start = fake_start
-            daemon._start(
-                {
-                    "name": "svc",
-                    "cwd": str(self.root),
-                    "argv": [sys.executable, "-c", "pass"],
-                    "maxLogBytes": 1024 * 1024,
-                    "rotateCount": 1,
-                }
-            )
-        finally:
-            pdc.HostedProcess.start = original_start
-            daemon.processes["svc"].close_log()
-
-        self.assertTrue(old_entry._logs_closed)
-        self.assertFalse(old_entry._fds)
+        self.assertTrue(response["forgotten"])
+        self.assertNotIn("svc", daemon.processes)
+        self.assertTrue(entry._logs_closed)
+        self.assertFalse(entry._fds)
 
     def test_failed_start_closes_new_log_handles(self) -> None:
         daemon = pdc.ProcHostDaemon(self.root, max_log_bytes=1024 * 1024, rotate_count=1)
@@ -161,6 +185,64 @@ class PyDaemonControlTest(unittest.TestCase):
 
         removed = self.run_json("profile", "remove", "profiled")
         self.assertTrue(removed["removed"])
+
+    def test_one_shot_start_reuses_stopped_entry_and_rejects_replacement(self) -> None:
+        code = (
+            "import pathlib\n"
+            "path = pathlib.Path('one-shot-count.txt')\n"
+            "count = int(path.read_text()) if path.exists() else 0\n"
+            "path.write_text(str(count + 1))\n"
+            "print('ONE_SHOT:%d' % (count + 1), flush=True)\n"
+        )
+        self.run_json("start", "oneshot", "--", sys.executable, "-u", "-c", code)
+        self.wait_process_status("oneshot", lambda item: item.get("running") is False)
+
+        reused = self.run_json("start", "oneshot")
+        self.assertTrue(reused["reused"])
+        self.wait_process_status("oneshot", lambda item: item.get("running") is False)
+        self.assertEqual("2", (self.root / "one-shot-count.txt").read_text())
+
+        proc = self.run_ctl(
+            "start",
+            "oneshot",
+            "--",
+            sys.executable,
+            "-c",
+            "import pathlib; pathlib.Path('replacement-ran.txt').write_text('bad')",
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("different process spec", proc.stderr)
+        self.assertFalse((self.root / "replacement-ran.txt").exists())
+
+    def test_profile_change_requires_forget_before_new_spec_is_used(self) -> None:
+        old_code = "import time; print('OLD_PROFILE', flush=True); time.sleep(30)"
+        new_code = "import time; print('NEW_PROFILE', flush=True); time.sleep(30)"
+        self.run_json("profile", "set", "profiled", "--", sys.executable, "-u", "-c", old_code)
+        self.run_json("start", "profiled")
+        self.run_json("stop", "profiled", "--grace", "0.2", "--suppress-restart", timeout=5)
+        self.wait_process_status("profiled", lambda item: item.get("running") is False)
+
+        self.run_json("profile", "set", "profiled", "--", sys.executable, "-u", "-c", new_code)
+        proc = self.run_ctl("start", "profiled", check=False, timeout=5)
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("different process spec", proc.stderr)
+
+        forgotten = self.run_json("forget", "profiled")
+        self.assertTrue(forgotten["forgotten"])
+        self.run_json("start", "profiled")
+        deadline = time.time() + 5
+        tail: dict = {}
+        while time.time() < deadline:
+            tail = self.run_json("tail", "profiled", "--bytes", "4096")
+            if "NEW_PROFILE" in self.stream_text(tail, "stdout"):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"NEW_PROFILE did not appear in tail: {tail}")
+        self.assertIn("NEW_PROFILE", self.stream_text(tail, "stdout"))
+        self.assertNotIn("OLD_PROFILE", self.stream_text(tail, "stdout"))
 
     def test_restart_rejects_new_argv_and_keeps_process_running(self) -> None:
         self.start_echo_process()
@@ -286,6 +368,66 @@ class PyDaemonControlTest(unittest.TestCase):
         response = self.run_json("cmd", "flaky", "ok", "--wait", "1", "--bytes", "4096")
         self.assertIn("AFTER_RESTART:ok", self.stream_text(response, "stdout"))
         self.assertEqual("2", (self.root / "attempt.txt").read_text())
+
+    def test_stop_cancels_pending_restart(self) -> None:
+        self.start_flapping_process("flap", delay="1.0")
+        self.wait_process_status("flap", lambda item: item.get("restartPendingUntil") is not None)
+
+        stopped = self.run_json("stop", "flap", "--grace", "0.1", timeout=5)
+        self.assertFalse(stopped["stopped"])
+        self.assertEqual("restart canceled", stopped["reason"])
+        time.sleep(1.3)
+
+        proc_status = self.run_json("status")["processes"]["flap"]
+        self.assertFalse(proc_status["running"])
+        self.assertIsNone(proc_status["restartPendingUntil"])
+        self.assertEqual(0, proc_status["restartCount"])
+        self.assertEqual("1", (self.root / "flap-attempts.txt").read_text())
+
+    def test_pending_restart_rejects_send_start_and_restart(self) -> None:
+        self.start_flapping_process("pending", delay="1.0")
+        self.wait_process_status("pending", lambda item: item.get("restartPendingUntil") is not None)
+
+        send = self.run_ctl("cmd", "pending", "should-not-queue", check=False, timeout=5)
+        self.assertNotEqual(0, send.returncode)
+        self.assertIn("restart pending", send.stderr)
+
+        start = self.run_ctl(
+            "start",
+            "pending",
+            "--",
+            sys.executable,
+            "-c",
+            "print('replacement')",
+            check=False,
+            timeout=5,
+        )
+        self.assertNotEqual(0, start.returncode)
+        self.assertIn("restart pending", start.stderr)
+
+        restart = self.run_ctl("restart", "pending", "--grace", "0.1", check=False, timeout=5)
+        self.assertNotEqual(0, restart.returncode)
+        self.assertIn("restart pending", restart.stderr)
+
+        self.wait_process_status(
+            "pending",
+            lambda item: item.get("running") is True and item.get("restartCount") == 1,
+            timeout=5,
+        )
+        response = self.run_json("cmd", "pending", "after", "--wait", "1", "--bytes", "4096")
+        stdout = self.stream_text(response, "stdout")
+        self.assertIn("AFTER_RESTART:after", stdout)
+        self.assertNotIn("should-not-queue", stdout)
+
+    def test_daemon_stop_cancels_pending_restart(self) -> None:
+        self.start_flapping_process("daemonpending", delay="1.0")
+        self.wait_process_status("daemonpending", lambda item: item.get("restartPendingUntil") is not None)
+
+        stopped = self.run_json("daemon-stop", "--stop-children", "--grace", "0.1", timeout=5)
+        self.assertTrue(stopped["stopping"])
+        time.sleep(1.3)
+
+        self.assertEqual("1", (self.root / "daemonpending-attempts.txt").read_text())
 
     def test_stop_suppress_restart_blocks_always_restart_once(self) -> None:
         code = "import time; print('SLEEPING', flush=True); time.sleep(30)"
@@ -494,6 +636,36 @@ class PyDaemonControlTest(unittest.TestCase):
             self.fail(f"attach failed\nstdout={proc.stdout}\nstderr={proc.stderr}")
         self.assertIn("ECHO:hello", proc.stdout)
         self.assertIn("BYE", proc.stdout)
+
+    def test_attach_rejects_input_while_restart_is_pending(self) -> None:
+        self.start_flapping_process("attachpending", delay="0.5")
+        self.wait_process_status("attachpending", lambda item: item.get("restartPendingUntil") is not None)
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "--root",
+                str(self.root),
+                "attach",
+                "attachpending",
+                "--history",
+                "0",
+                "--poll",
+                "0.05",
+                "--drain-on-eof",
+                "1",
+            ],
+            input="during-pending\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        if proc.returncode != 0:
+            self.fail(f"attach failed\nstdout={proc.stdout}\nstderr={proc.stderr}")
+        self.assertIn("input rejected", proc.stderr)
+        self.assertNotIn("AFTER_RESTART:during-pending", proc.stdout)
 
     def test_concurrent_cmd_writes_do_not_interleave_stdin(self) -> None:
         self.start_echo_process()

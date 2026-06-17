@@ -121,6 +121,13 @@ Stop a child process:
 pydaemoncontrol --root /srv/example stop app --grace 5 --suppress-restart
 ```
 
+Forget a stopped process entry so the next `start` can create it from a new
+profile or argv:
+
+```bash
+pydaemoncontrol --root /srv/example forget app
+```
+
 Stop the daemon:
 
 ```bash
@@ -218,17 +225,24 @@ pydaemoncontrol --root /srv/example profile remove app
 ```
 
 `start app` uses the saved profile when no argv is provided. If argv is
-provided, the command remains an immediate one-shot start spec:
+provided, the command is an immediate one-shot start spec:
 
 ```bash
 pydaemoncontrol --root /srv/example start app -- ./run-once.sh
 ```
 
+Once a daemon has a process entry named `app`, `start app` never replaces that
+entry's argv, cwd, log settings, or restart policy. If the entry is stopped,
+`start app` starts the existing entry's original spec again. If a profile was
+changed, or if a different one-shot argv is provided for the same name, `start`
+rejects the operation. Use `forget app` after the entry is stopped to discard
+the in-memory entry, then `start app` again to create it from the new profile or
+argv.
+
 `restart app` is deliberately narrower: it only restarts an existing process
 already managed by the daemon, using that process's current argv, cwd, log
 settings, and restart policy. It does not read a profile and it does not accept a
-replacement command. To change a command, update the profile or issue an
-explicit stop/start sequence.
+replacement command.
 
 Process spec options can be placed before or after the name:
 
@@ -267,6 +281,12 @@ longer, use `tail`, `read`, `status`, or `attach` to observe progress.
 Without `--suppress-restart`, exits still follow the configured restart policy.
 For example, a process with `--restart always` will come back after an
 unsuppressed `stop`.
+
+During a restart delay, the process is not running. Read operations such as
+`status`, `tail`, and `attach` can still observe output and state. Stdin writes,
+`start`, and `restart` are rejected until the process restarts. `stop` is the
+only lifecycle write accepted during this pending state; it cancels the pending
+restart and leaves the entry stopped.
 
 ## Command Semantics
 
