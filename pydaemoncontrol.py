@@ -1482,7 +1482,21 @@ class ProcHostClient:
 
 
 def print_json(data: Any) -> None:
-    print(json.dumps(data, ensure_ascii=False, indent=2))
+    print(json.dumps(data, ensure_ascii=True, indent=2))
+
+
+def write_stdout_text(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        if hasattr(sys.stdout, "buffer"):
+            sys.stdout.buffer.write(text.encode(encoding, errors="replace"))
+            sys.stdout.buffer.flush()
+        else:
+            sys.stdout.write(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+            sys.stdout.flush()
 
 
 def run_attach(
@@ -1508,8 +1522,7 @@ def run_attach(
     if history > 0:
         since_seq = tail_start_seq
         initial = client.request({"action": "read", "name": name, "sinceSeq": since_seq, "maxBytes": history})
-        sys.stdout.write(render_records_combined(initial, annotate_internal=True))
-        sys.stdout.flush()
+        write_stdout_text(render_records_combined(initial, annotate_internal=True))
         since_seq = int(initial.get("nextSeq", since_seq))
 
     input_queue: queue.Queue[str | None] = queue.Queue()
@@ -1561,8 +1574,7 @@ def run_attach(
         data = client.request({"action": "read", "name": name, "sinceSeq": since_seq, "maxBytes": read_bytes})
         output = render_records_combined(data, annotate_internal=True)
         if output:
-            sys.stdout.write(output)
-            sys.stdout.flush()
+            write_stdout_text(output)
         since_seq = int(data.get("nextSeq", since_seq))
         proc_status = data.get("status", {})
         running = bool(proc_status.get("running", False)) if isinstance(proc_status, dict) else False

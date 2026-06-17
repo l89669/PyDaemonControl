@@ -1,5 +1,6 @@
 import concurrent.futures
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -118,6 +119,27 @@ class PyDaemonControlTest(unittest.TestCase):
             f"        pathlib.Path('{marker_name}').write_text('graceful')\n"
             "        print('GRACEFUL_SHUTDOWN', flush=True)\n"
             "        sys.exit(0)\n"
+        )
+
+    def run_with_stdio_encoding(
+        self,
+        encoding: str,
+        *args: str,
+        input_text: str | None = None,
+        timeout: float = 15,
+    ) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = encoding
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--root", str(self.root), *args],
+            input=input_text,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
         )
 
     def test_single_daemon_per_root(self) -> None:
@@ -698,6 +720,36 @@ class PyDaemonControlTest(unittest.TestCase):
         response = self.run_json("cmd", "echo", "exit", "--wait", "1", "--bytes", "4096")
         self.assertIn("BYE", self.stream_text(response, "stdout"))
 
+    def test_json_output_is_ascii_safe_for_restricted_stdout_encoding(self) -> None:
+        text = "UNICODE: 中文 🚀"
+        code = f"import sys; sys.stdout.buffer.write(({text!r} + '\\n').encode('utf-8')); sys.stdout.flush()"
+        self.run_json("start", "unicodejson", "--", sys.executable, "-u", "-c", code)
+        self.wait_process_status("unicodejson", lambda item: item.get("running") is False)
+
+        deadline = time.time() + 5
+        proc: subprocess.CompletedProcess[str] | None = None
+        payload: dict = {}
+        while time.time() < deadline:
+            proc = self.run_with_stdio_encoding(
+                "cp1252",
+                "tail",
+                "unicodejson",
+                "--bytes",
+                "4096",
+                timeout=5,
+            )
+            self.assertEqual(0, proc.returncode, proc.stderr)
+            payload = json.loads(proc.stdout)
+            if text in self.stream_text(payload, "stdout"):
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"unicode output did not appear in tail: {payload}")
+
+        self.assertIsNotNone(proc)
+        self.assertNotIn(text, proc.stdout)
+        self.assertIn(text, self.stream_text(payload, "stdout"))
+
     def test_stdout_stderr_are_split_with_global_seq(self) -> None:
         code = (
             "import sys, time\n"
@@ -801,6 +853,31 @@ class PyDaemonControlTest(unittest.TestCase):
             self.fail(f"attach failed\nstdout={proc.stdout}\nstderr={proc.stderr}")
         self.assertIn("ECHO:hello", proc.stdout)
         self.assertIn("BYE", proc.stdout)
+
+    def test_attach_does_not_crash_on_restricted_stdout_encoding(self) -> None:
+        text = "UNICODE: 中文 🚀"
+        code = (
+            f"import sys, time; sys.stdout.buffer.write(({text!r} + '\\n').encode('utf-8')); "
+            "sys.stdout.flush(); time.sleep(1)"
+        )
+        self.run_json("start", "unicodeattach", "--", sys.executable, "-u", "-c", code)
+
+        proc = self.run_with_stdio_encoding(
+            "cp1252",
+            "attach",
+            "unicodeattach",
+            "--history",
+            "4096",
+            "--poll",
+            "0.05",
+            "--drain-on-eof",
+            "0.2",
+            input_text="",
+            timeout=10,
+        )
+
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertIn("UNICODE:", proc.stdout)
 
     def test_attach_rejects_input_while_restart_is_pending(self) -> None:
         self.start_flapping_process("attachpending", delay="0.5")
