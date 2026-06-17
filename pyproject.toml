@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pydaemoncontrol"
+version = "0.1.0"
+description = "A lightweight directory-scoped daemon/client for controlling long-running processes."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "l89669" }
+]
+keywords = ["daemon", "process", "supervisor", "stdin", "logs"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: Console",
+  "Topic :: System :: Systems Administration",
+]
+
+[project.scripts]
+pydaemoncontrol = "pydaemoncontrol:main"
+
+[tool.setuptools]
+py-modules = ["pydaemoncontrol"]
