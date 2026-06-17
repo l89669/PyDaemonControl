@@ -29,6 +29,9 @@ a distributed process manager.
 - Keep operation timeouts phase-specific: RPC/startup overhead, stdin write
   confirmation, post-input output capture, output quiet window, and stop grace
   are separate knobs with separate tests.
+- Keep profiles and restart policies generic. They should make Minecraft servers
+  comfortable to manage without adding Minecraft-specific lifecycle semantics to
+  the core process controller.
 
 ## Editing Guidance
 

@@ -55,6 +55,11 @@ DEFAULT_START_POLL_INTERVAL = 0.1
 DEFAULT_ATTACH_HISTORY_BYTES = 20000
 DEFAULT_ATTACH_POLL = 0.2
 DEFAULT_ATTACH_DRAIN_ON_EOF = 1.0
+DEFAULT_RESTART_MODE = "never"
+DEFAULT_RESTART_DELAY = 2.0
+DEFAULT_RESTART_MAX_ATTEMPTS = 0
+DEFAULT_RESTART_WINDOW = 60.0
+RESTART_MODES = {"never", "on-failure", "always"}
 IS_WINDOWS = os.name == "nt"
 LOG_OPEN_FLAGS = os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_BINARY", 0)
 
@@ -123,6 +128,32 @@ def format_stdin_log(text: str) -> str:
     )
 
 
+def default_restart_policy() -> dict[str, Any]:
+    return {
+        "mode": DEFAULT_RESTART_MODE,
+        "delay": DEFAULT_RESTART_DELAY,
+        "maxAttempts": DEFAULT_RESTART_MAX_ATTEMPTS,
+        "window": DEFAULT_RESTART_WINDOW,
+    }
+
+
+def normalize_restart_policy(raw: Any | None) -> dict[str, Any]:
+    base = default_restart_policy()
+    if raw is None:
+        return base
+    if not isinstance(raw, dict):
+        raise RpcError("restart policy must be an object")
+    mode = str(raw.get("mode", base["mode"]))
+    if mode not in RESTART_MODES:
+        raise RpcError(f"restart mode must be one of: {', '.join(sorted(RESTART_MODES))}")
+    return {
+        "mode": mode,
+        "delay": require_seconds(raw.get("delay", base["delay"]), "restart delay", positive=False),
+        "maxAttempts": require_int_at_least(raw.get("maxAttempts", base["maxAttempts"]), "restart maxAttempts", 0),
+        "window": require_seconds(raw.get("window", base["window"]), "restart window", positive=True),
+    }
+
+
 def state_paths(root: Path) -> dict[str, Path]:
     state = root / ".pydaemoncontrol"
     return {
@@ -133,6 +164,7 @@ def state_paths(root: Path) -> dict[str, Path]:
         "pid": state / "daemon.pid",
         "lock": state / "daemon.lock",
         "daemon_log": state / "daemon.log",
+        "profiles": state / "profiles.json",
     }
 
 
@@ -169,6 +201,149 @@ def write_daemon_log(paths: dict[str, Path], message: str) -> None:
     line = f"[{now_stamp()} daemon] {message}\n"
     with paths["daemon_log"].open("a", encoding="utf-8") as fh:
         fh.write(line)
+
+
+def load_profiles(paths: dict[str, Path]) -> dict[str, Any]:
+    profile_path = paths["profiles"]
+    if not profile_path.exists():
+        return {"version": 1, "profiles": {}}
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RpcError(f"invalid profiles file: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RpcError("profiles file must contain a json object")
+    profiles = data.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise RpcError("profiles file field 'profiles' must be an object")
+    return {"version": int(data.get("version", 1)), "profiles": profiles}
+
+
+def save_profiles(paths: dict[str, Path], data: dict[str, Any]) -> None:
+    paths["state"].mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "profiles": data.get("profiles", {}),
+    }
+    tmp_path = paths["profiles"].with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(paths["profiles"])
+
+
+def normalize_process_spec(
+    root: Path,
+    name: str,
+    cwd_raw: Any,
+    argv: Any,
+    max_log_bytes: Any,
+    rotate_count: Any,
+    restart_policy: Any | None,
+) -> dict[str, Any]:
+    name = sanitize_name(name)
+    if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
+        raise RpcError("argv must be a non-empty list of strings")
+    cwd = Path(cwd_raw).resolve() if cwd_raw else root
+    return {
+        "name": name,
+        "cwd": str(cwd),
+        "argv": argv,
+        "maxLogBytes": require_int_at_least(max_log_bytes, "maxLogBytes", 0),
+        "rotateCount": require_int_at_least(rotate_count, "rotateCount", 0),
+        "restart": normalize_restart_policy(restart_policy),
+    }
+
+
+def profile_to_request(action: str, profile: dict[str, Any], grace: float | None = None) -> dict[str, Any]:
+    request = {
+        "action": action,
+        "name": profile["name"],
+        "cwd": profile["cwd"],
+        "argv": profile["argv"],
+        "maxLogBytes": profile["maxLogBytes"],
+        "rotateCount": profile["rotateCount"],
+        "restart": profile["restart"],
+    }
+    if grace is not None:
+        request["grace"] = grace
+    return request
+
+
+def restart_policy_from_args(args: Any) -> dict[str, Any]:
+    return normalize_restart_policy(
+        {
+            "mode": args.restart,
+            "delay": args.restart_delay,
+            "maxAttempts": args.restart_max_attempts,
+            "window": args.restart_window,
+        }
+    )
+
+
+def get_profile(paths: dict[str, Path], name: str) -> dict[str, Any]:
+    name = sanitize_name(name)
+    profiles = load_profiles(paths)["profiles"]
+    profile = profiles.get(name)
+    if profile is None:
+        raise RpcError(f"unknown profile: {name}")
+    if not isinstance(profile, dict):
+        raise RpcError(f"profile {name} must be an object")
+    return profile
+
+
+def add_process_spec_arguments(parser: argparse.ArgumentParser, *, include_grace: bool = False) -> None:
+    parser.add_argument("name")
+    parser.add_argument("--cwd", default=None)
+    if include_grace:
+        parser.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
+    parser.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
+    parser.add_argument("--rotate-count", type=int, default=DEFAULT_ROTATE_COUNT)
+    parser.add_argument("--restart", choices=sorted(RESTART_MODES), default=DEFAULT_RESTART_MODE)
+    parser.add_argument("--restart-delay", type=float, default=DEFAULT_RESTART_DELAY)
+    parser.add_argument("--restart-max-attempts", type=int, default=DEFAULT_RESTART_MAX_ATTEMPTS)
+    parser.add_argument("--restart-window", type=float, default=DEFAULT_RESTART_WINDOW)
+
+
+def add_outer_process_option_arguments(parser: argparse.ArgumentParser, *, include_grace: bool = False) -> None:
+    parser.add_argument("--cwd", dest="proc_cwd")
+    if include_grace:
+        parser.add_argument("--grace", type=float, dest="proc_grace")
+    parser.add_argument("--max-log-bytes", type=int, dest="proc_max_log_bytes")
+    parser.add_argument("--rotate-count", type=int, dest="proc_rotate_count")
+    parser.add_argument("--restart", choices=sorted(RESTART_MODES), dest="proc_restart")
+    parser.add_argument("--restart-delay", type=float, dest="proc_restart_delay")
+    parser.add_argument("--restart-max-attempts", type=int, dest="proc_restart_max_attempts")
+    parser.add_argument("--restart-window", type=float, dest="proc_restart_window")
+
+
+def apply_outer_process_options(spec_args: Any, outer_args: Any) -> Any:
+    mapping = {
+        "proc_cwd": "cwd",
+        "proc_grace": "grace",
+        "proc_max_log_bytes": "max_log_bytes",
+        "proc_rotate_count": "rotate_count",
+        "proc_restart": "restart",
+        "proc_restart_delay": "restart_delay",
+        "proc_restart_max_attempts": "restart_max_attempts",
+        "proc_restart_window": "restart_window",
+    }
+    for source, target in mapping.items():
+        value = getattr(outer_args, source, None)
+        if value is not None:
+            setattr(spec_args, target, value)
+    return spec_args
+
+
+def parse_process_spec_tokens(tokens: list[str], prog: str, *, include_grace: bool = False) -> tuple[Any, list[str]]:
+    if "--" in tokens:
+        marker = tokens.index("--")
+        spec_tokens = tokens[:marker]
+        proc_argv = tokens[marker + 1 :]
+    else:
+        spec_tokens = tokens
+        proc_argv = []
+    parser = argparse.ArgumentParser(prog=prog)
+    add_process_spec_arguments(parser, include_grace=include_grace)
+    return parser.parse_args(spec_tokens), proc_argv
 
 
 class DaemonLock:
@@ -430,6 +605,7 @@ class HostedProcess:
     cwd: Path
     log_path: Path
     supervisor: ProcessSupervisor
+    restart_policy: dict[str, Any] = field(default_factory=default_restart_policy)
     max_log_bytes: int = DEFAULT_MAX_LOG_BYTES
     rotate_count: int = DEFAULT_ROTATE_COUNT
     tail_chars: int = DEFAULT_TAIL_CHARS
@@ -437,6 +613,10 @@ class HostedProcess:
     started_at: float = field(default_factory=time.time)
     exited_at: float | None = None
     exit_code: int | None = None
+    suppress_restart_on_next_exit: bool = False
+    restart_count: int = 0
+    last_restart_at: float | None = None
+    restart_pending_until: float | None = None
     bytes_written: int = 0
     current_base_offset: int = 0
     _fd: int | None = None
@@ -448,6 +628,7 @@ class HostedProcess:
     _tail: deque[str] = field(default_factory=deque)
     _tail_len: int = 0
     _line_open: dict[str, bool] = field(default_factory=dict)
+    _restart_attempts: deque[float] = field(default_factory=deque)
 
     def __post_init__(self) -> None:
         self._cond = threading.Condition(self._lock)
@@ -479,15 +660,26 @@ class HostedProcess:
             "logPath": str(self.log_path),
             "bytesWritten": self.bytes_written,
             "currentBaseOffset": self.current_base_offset,
+            "restartPolicy": self.restart_policy,
+            "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
+            "restartCount": self.restart_count,
+            "lastRestartAt": self.last_restart_at,
+            "restartPendingUntil": self.restart_pending_until,
         }
 
-    def start(self) -> None:
+    def start(self, restarted: bool = False) -> None:
         if self.proc is not None and self.proc.poll() is None:
             raise RpcError(f"{self.name} is already running")
         self.started_at = time.time()
         self.exited_at = None
         self.exit_code = None
-        self.write_event("system", "starting: " + " ".join(self.argv))
+        self.suppress_restart_on_next_exit = False
+        self.restart_pending_until = None
+        self._stdin_queue = queue.Queue(maxsize=STDIN_QUEUE_LIMIT)
+        if restarted:
+            self.last_restart_at = self.started_at
+            self.restart_count += 1
+        self.write_event("system", ("restarting: " if restarted else "starting: ") + " ".join(self.argv))
         self.proc = subprocess.Popen(
             self.argv,
             cwd=str(self.cwd),
@@ -522,6 +714,53 @@ class HostedProcess:
         except queue.Full:
             pass
         self.write_event("system", f"process exited with code {code}")
+        self._maybe_schedule_restart(code)
+
+    def _restart_allowed(self, code: int) -> bool:
+        policy = normalize_restart_policy(self.restart_policy)
+        mode = policy["mode"]
+        if self.suppress_restart_on_next_exit:
+            self.suppress_restart_on_next_exit = False
+            self.write_event("system", "restart suppressed for this exit")
+            return False
+        if mode == "never":
+            return False
+        if mode == "on-failure" and code == 0:
+            return False
+        now = time.time()
+        window = float(policy["window"])
+        while self._restart_attempts and now - self._restart_attempts[0] > window:
+            self._restart_attempts.popleft()
+        max_attempts = int(policy["maxAttempts"])
+        if max_attempts > 0 and len(self._restart_attempts) >= max_attempts:
+            self.write_event(
+                "system",
+                f"restart suppressed: maxAttempts={max_attempts} reached within {window:g}s",
+            )
+            return False
+        self._restart_attempts.append(now)
+        return True
+
+    def _maybe_schedule_restart(self, code: int) -> None:
+        if not self._restart_allowed(code):
+            return
+        policy = normalize_restart_policy(self.restart_policy)
+        delay = float(policy["delay"])
+        self.restart_pending_until = time.time() + delay
+        self.write_event("system", f"restart scheduled in {delay:g}s by policy {policy['mode']}")
+        threading.Thread(target=self._restart_after_delay, args=(delay,), daemon=True).start()
+
+    def _restart_after_delay(self, delay: float) -> None:
+        if delay > 0:
+            time.sleep(delay)
+        if self.running:
+            self.restart_pending_until = None
+            return
+        try:
+            self.start(restarted=True)
+        except Exception as exc:
+            self.restart_pending_until = None
+            self.write_event("system", f"restart failed: {exc}")
 
     def _stdin_writer(self) -> None:
         while True:
@@ -683,6 +922,7 @@ class HostedProcess:
         wait: float,
         quiet: float,
         max_bytes: int,
+        suppress_restart: bool = False,
     ) -> dict[str, Any]:
         if not self.running or self.proc is None or self.proc.stdin is None:
             raise RpcError(f"{self.name} is not running")
@@ -694,6 +934,9 @@ class HostedProcess:
             self._stdin_queue.put_nowait(job)
         except queue.Full as exc:
             raise RpcError(f"{self.name} stdin queue is full") from exc
+        if suppress_restart:
+            self.suppress_restart_on_next_exit = True
+            self.write_event("system", "next process exit will suppress restart")
 
         if not job.done.wait(max(0.0, input_wait)):
             return {
@@ -701,6 +944,8 @@ class HostedProcess:
                 "queued": True,
                 "written": False,
                 "inputWaitExpired": True,
+                "suppressRestartRequested": suppress_restart,
+                "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
                 "output": self.read_since(offset, max_bytes),
             }
         if job.error is not None:
@@ -712,12 +957,21 @@ class HostedProcess:
             "queued": True,
             "written": job.written,
             "inputWaitExpired": False,
+            "suppressRestartRequested": suppress_restart,
+            "suppressRestartOnNextExit": self.suppress_restart_on_next_exit,
             "output": self.read_since(offset, max_bytes),
         }
 
-    def stop(self, grace: float) -> dict[str, Any]:
+    def stop(self, grace: float, suppress_restart: bool = False) -> dict[str, Any]:
         if not self.running or self.proc is None:
+            if suppress_restart:
+                self.suppress_restart_on_next_exit = True
+            self.restart_pending_until = None
             return {"stopped": False, "reason": "not running", "status": self.status()}
+        if suppress_restart:
+            self.suppress_restart_on_next_exit = True
+            self.write_event("system", "next process exit will suppress restart")
+        self.restart_pending_until = None
         self.supervisor.stop_process(self.proc, self.write_event, grace)
         return {"stopped": True, "status": self.status()}
 
@@ -799,7 +1053,12 @@ class ProcHostDaemon:
         if action == "restart":
             name = sanitize_name(str(req.get("name", "")))
             if name in self.processes:
-                self.processes[name].stop(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
+                old_entry = self.processes[name]
+                old_entry.stop(
+                    require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False),
+                    suppress_restart=True,
+                )
+                old_entry.close_log()
             return self._start(req, replace=True)
         if action == "send":
             entry = self.get_process(str(req.get("name", "")))
@@ -810,6 +1069,7 @@ class ProcHostDaemon:
                 require_seconds(req.get("wait", DEFAULT_OUTPUT_WAIT), "wait", positive=False),
                 require_seconds(req.get("quiet", DEFAULT_OUTPUT_QUIET), "quiet", positive=False),
                 require_output_bytes(req.get("maxBytes", 65536)),
+                bool(req.get("suppressRestart", False)),
             )
         if action == "tail":
             entry = self.get_process(str(req.get("name", "")))
@@ -825,34 +1085,42 @@ class ProcHostDaemon:
             )
         if action == "stop":
             entry = self.get_process(str(req.get("name", "")))
-            return entry.stop(require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False))
+            return entry.stop(
+                require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False),
+                bool(req.get("suppressRestart", False)),
+            )
         if action == "daemon-stop":
             if req.get("stopChildren", False):
                 grace = require_seconds(req.get("grace", DEFAULT_STOP_GRACE), "grace", positive=False)
                 for entry in list(self.processes.values()):
-                    entry.stop(grace)
+                    entry.stop(grace, suppress_restart=True)
             self._shutdown.set()
             return {"stopping": True, "daemonPid": os.getpid()}
         raise RpcError(f"unknown action: {action}")
 
     def _start(self, req: dict[str, Any], replace: bool) -> dict[str, Any]:
-        name = sanitize_name(str(req.get("name", "")))
-        argv = req.get("argv")
-        if not isinstance(argv, list) or not argv or not all(isinstance(x, str) for x in argv):
-            raise RpcError("argv must be a non-empty list of strings")
-        cwd_raw = req.get("cwd")
-        cwd = Path(cwd_raw).resolve() if cwd_raw else self.root
+        spec = normalize_process_spec(
+            self.root,
+            str(req.get("name", "")),
+            req.get("cwd"),
+            req.get("argv"),
+            req.get("maxLogBytes", self.max_log_bytes),
+            req.get("rotateCount", self.rotate_count),
+            req.get("restart"),
+        )
+        name = spec["name"]
         if name in self.processes and self.processes[name].running and not replace:
             raise RpcError(f"{name} is already running")
         log_path = self.paths["logs"] / f"{name}.log"
         entry = HostedProcess(
             name=name,
-            argv=argv,
-            cwd=cwd,
+            argv=list(spec["argv"]),
+            cwd=Path(spec["cwd"]),
             log_path=log_path,
             supervisor=self.platform.processes,
-            max_log_bytes=require_int_at_least(req.get("maxLogBytes", self.max_log_bytes), "maxLogBytes", 0),
-            rotate_count=require_int_at_least(req.get("rotateCount", self.rotate_count), "rotateCount", 0),
+            restart_policy=dict(spec["restart"]),
+            max_log_bytes=int(spec["maxLogBytes"]),
+            rotate_count=int(spec["rotateCount"]),
         )
         self.processes[name] = entry
         entry.start()
@@ -1039,20 +1307,24 @@ def build_parser() -> argparse.ArgumentParser:
     stop_daemon.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
     sub.add_parser("status", help="Show daemon and process status")
 
-    start = sub.add_parser("start", help="Start a named process")
-    start.add_argument("name")
-    start.add_argument("--cwd", default=None)
-    start.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
-    start.add_argument("--rotate-count", type=int, default=DEFAULT_ROTATE_COUNT)
-    start.add_argument("argv", nargs=argparse.REMAINDER)
+    start = sub.add_parser("start", help="Start a named process or saved profile")
+    add_outer_process_option_arguments(start)
+    start.add_argument("tokens", nargs=argparse.REMAINDER)
 
-    restart = sub.add_parser("restart", help="Stop and start a named process")
-    restart.add_argument("name")
-    restart.add_argument("--cwd", default=None)
-    restart.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
-    restart.add_argument("--max-log-bytes", type=int, default=DEFAULT_MAX_LOG_BYTES)
-    restart.add_argument("--rotate-count", type=int, default=DEFAULT_ROTATE_COUNT)
-    restart.add_argument("argv", nargs=argparse.REMAINDER)
+    restart = sub.add_parser("restart", help="Stop and start a named process or saved profile")
+    add_outer_process_option_arguments(restart, include_grace=True)
+    restart.add_argument("tokens", nargs=argparse.REMAINDER)
+
+    profile = sub.add_parser("profile", help="Manage saved process profiles")
+    profile_sub = profile.add_subparsers(dest="profile_cmd", required=True)
+    profile_sub.add_parser("list", help="List saved profiles")
+    profile_show = profile_sub.add_parser("show", help="Show one saved profile")
+    profile_show.add_argument("name")
+    profile_remove = profile_sub.add_parser("remove", help="Remove one saved profile")
+    profile_remove.add_argument("name")
+    profile_set = profile_sub.add_parser("set", help="Create or update a saved profile")
+    add_outer_process_option_arguments(profile_set)
+    profile_set.add_argument("tokens", nargs=argparse.REMAINDER)
 
     send = sub.add_parser("send", help="Send text to a process stdin")
     send.add_argument("name")
@@ -1062,6 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--wait", type=float, default=DEFAULT_OUTPUT_WAIT)
     send.add_argument("--quiet", type=float, default=DEFAULT_OUTPUT_QUIET)
     send.add_argument("--bytes", type=int, default=65536)
+    send.add_argument("--suppress-restart", action="store_true")
 
     cmd = sub.add_parser("cmd", help="Alias for send")
     cmd.add_argument("name")
@@ -1071,6 +1344,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd.add_argument("--wait", type=float, default=DEFAULT_OUTPUT_WAIT)
     cmd.add_argument("--quiet", type=float, default=DEFAULT_OUTPUT_QUIET)
     cmd.add_argument("--bytes", type=int, default=65536)
+    cmd.add_argument("--suppress-restart", action="store_true")
 
     tail = sub.add_parser("tail", help="Print recent process output")
     tail.add_argument("name")
@@ -1087,13 +1361,8 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="Stop a named process")
     stop.add_argument("name")
     stop.add_argument("--grace", type=float, default=DEFAULT_STOP_GRACE)
+    stop.add_argument("--suppress-restart", action="store_true")
     return parser
-
-
-def clean_argv(argv: list[str]) -> list[str]:
-    if argv and argv[0] == "--":
-        return argv[1:]
-    return argv
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1114,6 +1383,40 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "status":
             print_json(client.request({"action": "status"}))
             return 0
+        if args.cmd == "profile":
+            profiles_doc = load_profiles(client.paths)
+            profiles = profiles_doc["profiles"]
+            if args.profile_cmd == "list":
+                print_json({"profiles": profiles})
+                return 0
+            if args.profile_cmd == "show":
+                print_json(get_profile(client.paths, args.name))
+                return 0
+            if args.profile_cmd == "remove":
+                name = sanitize_name(args.name)
+                if name not in profiles:
+                    raise RpcError(f"unknown profile: {name}")
+                del profiles[name]
+                save_profiles(client.paths, profiles_doc)
+                print_json({"removed": True, "name": name})
+                return 0
+            if args.profile_cmd == "set":
+                spec_args, proc_argv = parse_process_spec_tokens(args.tokens, "pydaemoncontrol profile set")
+                spec_args = apply_outer_process_options(spec_args, args)
+                profile = normalize_process_spec(
+                    root,
+                    spec_args.name,
+                    spec_args.cwd,
+                    proc_argv,
+                    spec_args.max_log_bytes,
+                    spec_args.rotate_count,
+                    restart_policy_from_args(spec_args),
+                )
+                profiles[profile["name"]] = profile
+                save_profiles(client.paths, profiles_doc)
+                print_json({"saved": True, "profile": profile})
+                return 0
+            raise RpcError(f"unknown profile command: {args.profile_cmd}")
         if args.cmd == "daemon-stop":
             grace = require_seconds(args.grace, "grace", positive=False)
             print_json(
@@ -1128,23 +1431,30 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         if args.cmd in {"start", "restart"}:
-            proc_argv = clean_argv(args.argv)
-            if not proc_argv:
-                raise RpcError("missing process command after --")
+            spec_args, proc_argv = parse_process_spec_tokens(
+                args.tokens,
+                f"pydaemoncontrol {args.cmd}",
+                include_grace=args.cmd == "restart",
+            )
+            spec_args = apply_outer_process_options(spec_args, args)
+            if proc_argv:
+                profile = normalize_process_spec(
+                    root,
+                    spec_args.name,
+                    spec_args.cwd,
+                    proc_argv,
+                    spec_args.max_log_bytes,
+                    spec_args.rotate_count,
+                    restart_policy_from_args(spec_args),
+                )
+            else:
+                profile = get_profile(client.paths, spec_args.name)
             if not client.daemon_running():
                 client.start_daemon(max_log_bytes, rotate_count)
-            grace = require_seconds(getattr(args, "grace", DEFAULT_STOP_GRACE), "grace", positive=False)
+            grace = require_seconds(getattr(spec_args, "grace", DEFAULT_STOP_GRACE), "grace", positive=False)
             print_json(
                 client.request(
-                    {
-                        "action": args.cmd,
-                        "name": args.name,
-                        "cwd": args.cwd,
-                        "argv": proc_argv,
-                        "grace": grace,
-                        "maxLogBytes": max_log_bytes,
-                        "rotateCount": rotate_count,
-                    },
+                    profile_to_request(args.cmd, profile, grace if args.cmd == "restart" else None),
                     timeout=client.timeout + (grace if args.cmd == "restart" else 0.0),
                 )
             )
@@ -1165,6 +1475,7 @@ def main(argv: list[str] | None = None) -> int:
                         "wait": wait,
                         "quiet": quiet,
                         "maxBytes": max_bytes,
+                        "suppressRestart": bool(args.suppress_restart),
                     },
                     timeout=client.timeout + input_wait + wait,
                 )
@@ -1186,7 +1497,12 @@ def main(argv: list[str] | None = None) -> int:
             grace = require_seconds(args.grace, "grace", positive=False)
             print_json(
                 client.request(
-                    {"action": "stop", "name": args.name, "grace": grace},
+                    {
+                        "action": "stop",
+                        "name": args.name,
+                        "grace": grace,
+                        "suppressRestart": bool(args.suppress_restart),
+                    },
                     timeout=client.timeout + grace,
                 )
             )

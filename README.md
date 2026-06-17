@@ -48,6 +48,13 @@ starts it first.
 pydaemoncontrol --root /srv/example start app -- ./run-server.sh
 ```
 
+Save a reusable process profile and start it later:
+
+```bash
+pydaemoncontrol --root /srv/example profile set app --restart on-failure --restart-delay 3 -- ./run-server.sh
+pydaemoncontrol --root /srv/example start app
+```
+
 Send one line to the process stdin and return output produced after the input:
 
 ```bash
@@ -58,6 +65,13 @@ If stdin writing itself may be slow, give that phase its own budget:
 
 ```bash
 pydaemoncontrol --root /srv/example cmd app 'status' --input-wait 2 --wait 1 --bytes 12000
+```
+
+If a line command is intended to make the process exit, suppress restart for
+that one exit:
+
+```bash
+pydaemoncontrol --root /srv/example cmd app 'stop' --suppress-restart --wait 5 --bytes 20000
 ```
 
 Read recent output without sending input:
@@ -81,7 +95,7 @@ pydaemoncontrol --root /srv/example status
 Stop a child process:
 
 ```bash
-pydaemoncontrol --root /srv/example stop app --grace 5
+pydaemoncontrol --root /srv/example stop app --grace 5 --suppress-restart
 ```
 
 Stop the daemon:
@@ -95,10 +109,20 @@ pydaemoncontrol --root /srv/example daemon-stop --stop-children --grace 5
 ```bash
 pydaemoncontrol \
   --root /home/minecraft/server \
-  start \
-  --cwd /home/minecraft/server \
+  profile set \
   mc \
+  --restart on-failure \
+  --restart-delay 10 \
+  --restart-max-attempts 5 \
+  --restart-window 300 \
+  --cwd /home/minecraft/server \
   -- java -Xms512M -Xmx2G -jar spigot.jar nogui
+```
+
+Start the saved profile:
+
+```bash
+pydaemoncontrol --root /home/minecraft/server start mc
 ```
 
 Run server console commands through the daemon:
@@ -126,6 +150,7 @@ For each root directory, `pydaemoncontrol` creates:
   daemon.sock
   daemon.endpoint.json
   daemon.log
+  profiles.json
   logs/
     <process>.log
     <process>.log.1
@@ -143,6 +168,71 @@ to rolling log files. Defaults:
 - in-memory tail cache: `256 KiB`
 
 The daemon does not keep full process output in memory.
+
+## Profiles
+
+Profiles are saved per root directory in `.pydaemoncontrol/profiles.json`. A
+profile records:
+
+- process name
+- working directory
+- argv
+- log rotation settings
+- restart policy
+
+Manage profiles with:
+
+```bash
+pydaemoncontrol --root /srv/example profile set app --restart on-failure -- ./run-server.sh
+pydaemoncontrol --root /srv/example profile list
+pydaemoncontrol --root /srv/example profile show app
+pydaemoncontrol --root /srv/example profile remove app
+```
+
+`start app` and `restart app` use the saved profile when no argv is provided. If
+argv is provided, the command remains an immediate one-shot start spec:
+
+```bash
+pydaemoncontrol --root /srv/example start app -- ./run-once.sh
+```
+
+Process spec options can be placed before or after the name:
+
+```bash
+pydaemoncontrol --root /srv/example profile set --restart on-failure app -- ./run-server.sh
+pydaemoncontrol --root /srv/example profile set app --restart on-failure -- ./run-server.sh
+```
+
+## Restart Policies
+
+Restart policy modes:
+
+- `never`: do not auto-restart.
+- `on-failure`: restart only when the process exits with a non-zero code.
+- `always`: restart after any exit unless the process was stopped by
+  `pydaemoncontrol stop`, `restart`, or `daemon-stop`.
+
+Policy options:
+
+- `--restart-delay`: seconds to wait before restarting.
+- `--restart-max-attempts`: maximum restarts inside the restart window; `0`
+  means unlimited.
+- `--restart-window`: rolling seconds used for `--restart-max-attempts`.
+
+For line-oriented server consoles that exit with code `0` after a normal
+shutdown command, `on-failure` is usually the safer default: crashes restart,
+while controlled exits stay stopped. Use `always` only when you explicitly want
+the process to come back after any unsuppressed exit.
+
+`cmd/send --suppress-restart` and `stop --suppress-restart` set a one-shot
+suppression flag for the process's next exit. They do not wait for the process
+to die, and they do not create a time window. `cmd/send --wait` still only
+controls how much output is collected after the input write. If shutdown takes
+longer, use `tail`, `read`, `status`, or `attach` to observe progress.
+
+Without `--suppress-restart`, exits still follow the configured restart policy.
+For example, a process with `--restart always` will come back after an
+unsuppressed `stop`.
 
 ## Command Semantics
 
@@ -216,4 +306,5 @@ The tests cover daemon singleton behavior, command/tail flow, concurrent client
 commands, attach with piped input, offset-based reads, bounded large-output
 handling with log rotation, command failure after child process exit, a
 non-reading child process that would otherwise block stdin writes, slow large
-stdin writes with explicit `--input-wait`, and response byte limit rejection.
+stdin writes with explicit `--input-wait`, response byte limit rejection,
+profiles, and on-failure restarts.

@@ -58,6 +58,176 @@ class PyDaemonControlTest(unittest.TestCase):
         second = self.run_json("daemon-start")
         self.assertEqual(first["pid"], second["pid"])
 
+    def test_profile_set_show_start_and_remove(self) -> None:
+        code = (
+            "import sys\n"
+            "print('PROFILE_READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    print('PROFILE:' + line.strip(), flush=True)\n"
+        )
+        saved = self.run_json(
+            "profile",
+            "set",
+            "profiled",
+            "--restart",
+            "never",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+        self.assertTrue(saved["saved"])
+        self.assertEqual("profiled", saved["profile"]["name"])
+
+        shown = self.run_json("profile", "show", "profiled")
+        self.assertEqual(shown["argv"], [sys.executable, "-u", "-c", code])
+
+        self.run_json("start", "profiled")
+        response = self.run_json("cmd", "profiled", "ok", "--wait", "1", "--bytes", "4096")
+        self.assertIn("PROFILE:ok", response["output"])
+
+        removed = self.run_json("profile", "remove", "profiled")
+        self.assertTrue(removed["removed"])
+
+    def test_on_failure_restart_policy_restarts_process(self) -> None:
+        code = (
+            "import pathlib, sys\n"
+            "path = pathlib.Path('attempt.txt')\n"
+            "count = int(path.read_text()) if path.exists() else 0\n"
+            "path.write_text(str(count + 1))\n"
+            "print('ATTEMPT:%d' % (count + 1), flush=True)\n"
+            "if count == 0:\n"
+            "    sys.exit(7)\n"
+            "for line in sys.stdin:\n"
+            "    print('AFTER_RESTART:' + line.strip(), flush=True)\n"
+        )
+        self.run_ctl(
+            "start",
+            "flaky",
+            "--restart",
+            "on-failure",
+            "--restart-delay",
+            "0.1",
+            "--restart-max-attempts",
+            "3",
+            "--restart-window",
+            "5",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+
+        client = pdc.ProcHostClient(self.root, SCRIPT, timeout=2)
+        deadline = time.time() + 5
+        status = {}
+        while time.time() < deadline:
+            status = client.request({"action": "status"})
+            proc_status = status["processes"]["flaky"]
+            if proc_status["running"] and proc_status["restartCount"] >= 1:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"process did not restart: {status}")
+
+        response = self.run_json("cmd", "flaky", "ok", "--wait", "1", "--bytes", "4096")
+        self.assertIn("AFTER_RESTART:ok", response["output"])
+        self.assertEqual("2", (self.root / "attempt.txt").read_text())
+
+    def test_stop_suppress_restart_blocks_always_restart_once(self) -> None:
+        code = "import time; print('SLEEPING', flush=True); time.sleep(30)"
+        self.run_ctl(
+            "start",
+            "sleeper",
+            "--restart",
+            "always",
+            "--restart-delay",
+            "0.1",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+        self.run_json("stop", "sleeper", "--grace", "0.2", "--suppress-restart", timeout=5)
+        time.sleep(0.6)
+        status = self.run_json("status")
+        proc_status = status["processes"]["sleeper"]
+        self.assertFalse(proc_status["running"])
+        self.assertEqual(0, proc_status["restartCount"])
+        self.assertFalse(proc_status["suppressRestartOnNextExit"])
+
+    def test_stop_without_suppress_restart_follows_always_policy(self) -> None:
+        code = "import time; print('SLEEPING', flush=True); time.sleep(30)"
+        self.run_ctl(
+            "start",
+            "sleeper",
+            "--restart",
+            "always",
+            "--restart-delay",
+            "0.1",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+        self.run_json("stop", "sleeper", "--grace", "0.2", timeout=5)
+        deadline = time.time() + 5
+        status = {}
+        while time.time() < deadline:
+            status = self.run_json("status")
+            proc_status = status["processes"]["sleeper"]
+            if proc_status["running"] and proc_status["restartCount"] >= 1:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"process did not restart after unsuppressed stop: {status}")
+
+    def test_cmd_suppress_restart_blocks_next_exit_once(self) -> None:
+        code = (
+            "import sys\n"
+            "print('READY', flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    if line.strip() == 'exit':\n"
+            "        print('EXITING', flush=True)\n"
+            "        sys.exit(3)\n"
+            "    print('ECHO:' + line.strip(), flush=True)\n"
+        )
+        self.run_ctl(
+            "start",
+            "commanded",
+            "--restart",
+            "always",
+            "--restart-delay",
+            "0.1",
+            "--",
+            sys.executable,
+            "-u",
+            "-c",
+            code,
+        )
+        response = self.run_json(
+            "cmd",
+            "commanded",
+            "exit",
+            "--suppress-restart",
+            "--wait",
+            "1",
+            "--bytes",
+            "4096",
+        )
+        self.assertTrue(response["suppressRestartRequested"])
+        self.assertIn("EXITING", response["output"])
+        time.sleep(0.6)
+        status = self.run_json("status")
+        proc_status = status["processes"]["commanded"]
+        self.assertFalse(proc_status["running"])
+        self.assertEqual(0, proc_status["restartCount"])
+        self.assertFalse(proc_status["suppressRestartOnNextExit"])
+
     def test_cmd_tail_and_clean_exit(self) -> None:
         self.start_echo_process()
         response = self.run_json("cmd", "echo", "hello", "--wait", "1", "--bytes", "4096")
